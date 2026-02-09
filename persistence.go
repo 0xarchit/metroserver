@@ -72,9 +72,12 @@ func (s *Server) SaveState() error {
 			})
 		}
 
+		// Get host ID from room state (room.Host can be nil after disconnection)
+		hostID := room.State.HostID
+
 		persistentRoom := PersistentRoom{
 			Code:               room.Code,
-			HostID:             room.Host.ID,
+			HostID:             hostID,
 			State:              room.State,
 			DisconnectedUsers:  room.DisconnectedUsers,
 			PendingSuggestions: pendingSuggestions,
