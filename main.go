@@ -8,8 +8,10 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -348,13 +350,14 @@ type Suggestion struct {
 
 // Server is the main WebSocket server
 type Server struct {
-	rooms    map[string]*Room
-	sessions map[string]*Session // sessionToken -> Session
-	clients  map[*Client]bool
-	upgrader websocket.Upgrader
-	mu       sync.RWMutex
-	logger   *zap.Logger
-	rng      *mathrand.Rand
+	rooms     map[string]*Room
+	sessions  map[string]*Session // sessionToken -> Session
+	clients   map[*Client]bool
+	upgrader  websocket.Upgrader
+	mu        sync.RWMutex
+	logger    *zap.Logger
+	rng       *mathrand.Rand
+	startTime time.Time // Track when server started for room retention logic
 }
 
 const (
@@ -362,6 +365,8 @@ const (
 	ReconnectGracePeriod = 15 * time.Minute
 	// How often to clean up expired sessions
 	SessionCleanupInterval = 1 * time.Minute
+	// Minimum time to keep empty rooms after server restart (for reconnection)
+	MinRoomRetentionAfterRestart = 2 * time.Minute
 	// Security limits
 	MaxUsernameLength    = 50
 	MaxRoomCodeLength    = 10
@@ -385,8 +390,9 @@ func NewServer(logger *zap.Logger) *Server {
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
 		},
-		logger: logger,
-		rng:    mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
+		logger:    logger,
+		rng:       mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
+		startTime: time.Now(),
 	}
 
 	// Start cleanup goroutines
@@ -402,6 +408,7 @@ func (s *Server) cleanupExpiredSessions() {
 	for range ticker.C {
 		s.mu.Lock()
 		now := time.Now()
+		minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
 		expiredTokens := make([]string, 0)
 
 		for token, session := range s.sessions {
@@ -430,6 +437,18 @@ func (s *Server) cleanupExpiredSessions() {
 					}
 				}
 				room.State.Users = newUsers
+
+				// Check if room should be deleted (no active clients, no disconnected users)
+				// Only delete if we're past the minimum retention time after server start
+				if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
+					if now.After(minRetentionTime) {
+						room.mu.Unlock()
+						delete(s.rooms, session.RoomCode)
+						s.logger.Info("Deleted empty room",
+							zap.String("room_code", session.RoomCode))
+						continue
+					}
+				}
 
 				// Notify remaining users
 				for _, client := range room.Clients {
@@ -2031,6 +2050,26 @@ func main() {
 	defer logger.Sync()
 
 	server := NewServer(logger)
+
+	// Load previous state if exists
+	if err := server.LoadState(); err != nil {
+		logger.Error("Failed to load previous state", zap.Error(err))
+		// Continue anyway - not fatal
+	}
+
+	// Set up graceful shutdown
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-shutdown
+		logger.Info("Shutdown signal received, saving state...")
+		if err := server.SaveState(); err != nil {
+			logger.Error("Failed to save state", zap.Error(err))
+		}
+		logger.Info("State saved, shutting down")
+		os.Exit(0)
+	}()
 
 	http.HandleFunc("/ws", server.handleWebSocket)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
