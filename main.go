@@ -76,12 +76,6 @@ const (
 	ActionSetVolume   = "set_volume"
 )
 
-// Message is the base message structure
-type Message struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload,omitempty"`
-}
-
 // CreateRoomPayload is for creating a new room
 type CreateRoomPayload struct {
 	Username string `json:"username"`
@@ -305,12 +299,6 @@ type Session struct {
 	DisconnectAt time.Time
 }
 
-// RateLimiter tracks message rates per client
-type RateLimiter struct {
-	messages []time.Time
-	mu       sync.Mutex
-}
-
 // Client represents a connected WebSocket client
 type Client struct {
 	ID           string
@@ -321,7 +309,6 @@ type Client struct {
 	Send         chan []byte
 	closed       bool
 	mu           sync.Mutex
-	rateLimiter  *RateLimiter
 	codec        *MessageCodec // Message codec for encoding/decoding
 }
 
@@ -374,8 +361,10 @@ const (
 	MaxTrackArtistLength = 200
 	MaxQueueSize         = 1000
 	// Connection limits
-	MaxReadMessageSize = 4194304 // 4MB (increased from 64KB)
+	MaxReadMessageSize = 524288 // 512KB (reasonable for queue syncs)
 	ReadTimeout        = 60 * time.Second
+	WriteTimeout       = 10 * time.Second
+	IdleTimeout        = 120 * time.Second
 )
 
 func NewServer(logger *zap.Logger) *Server {
@@ -499,11 +488,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Use Protobuf codec with compression enabled
 	client := &Client{
-		ID:          s.generateUserID(),
-		Conn:        conn,
-		Send:        make(chan []byte, 256),
-		rateLimiter: &RateLimiter{messages: make([]time.Time, 0)},
-		codec:       NewMessageCodec(true),
+		ID:    s.generateUserID(),
+		Conn:  conn,
+		Send:  make(chan []byte, 256),
+		codec: NewMessageCodec(true),
 	}
 
 	s.mu.Lock()
@@ -517,7 +505,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Client) writePump(logger *zap.Logger) {
-	ticker := time.NewTicker(30 * time.Second)
+	// Reduce ping frequency for efficiency (60s is sufficient for idle detection)
+	ticker := time.NewTicker(60 * time.Second)
 	defer func() {
 		ticker.Stop()
 		c.Conn.Close()
@@ -532,7 +521,7 @@ func (c *Client) writePump(logger *zap.Logger) {
 				return
 			}
 
-			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			if err := c.Conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
 				logger.Debug("Write error for client", zap.String("client_id", c.ID), zap.Error(err))
 				return
 			}
@@ -2093,7 +2082,15 @@ func main() {
 	logger.Info("Server starting",
 		zap.String("port", port))
 
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	// Configure HTTP server with timeouts for production
+	httpServer := &http.Server{
+		Addr:         ":" + port,
+		ReadTimeout:  ReadTimeout,
+		WriteTimeout: WriteTimeout,
+		IdleTimeout:  IdleTimeout,
+	}
+
+	if err := httpServer.ListenAndServe(); err != nil {
 		logger.Fatal("Server failed", zap.Error(err))
 	}
 }
