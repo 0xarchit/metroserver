@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
 	"fmt"
 	"io"
 
@@ -11,102 +10,26 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// MessageFormat indicates the format of a message
-type MessageFormat int
-
-const (
-	FormatJSON MessageFormat = iota
-	FormatProtobuf
-)
-
-// MessageCodec handles encoding/decoding of messages in different formats
+// MessageCodec handles encoding/decoding of messages using Protocol Buffers
 type MessageCodec struct {
-	format             MessageFormat
 	compressionEnabled bool
 }
 
-// NewMessageCodec creates a new codec with the specified format and compression settings
-func NewMessageCodec(format MessageFormat, compression bool) *MessageCodec {
+// NewMessageCodec creates a new codec with compression settings
+func NewMessageCodec(compression bool) *MessageCodec {
 	return &MessageCodec{
-		format:             format,
 		compressionEnabled: compression,
 	}
 }
 
-// detectMessageFormat detects if a message is JSON or Protobuf
-// JSON messages start with '{', Protobuf messages start with a field tag
-func detectMessageFormat(data []byte) MessageFormat {
-	if len(data) == 0 {
-		return FormatJSON // Default to JSON for empty messages
-	}
-	// JSON messages start with '{'
-	if data[0] == '{' {
-		return FormatJSON
-	}
-	// Protobuf messages have field tags (usually small numbers)
-	return FormatProtobuf
-}
-
-// Encode encodes a message with the codec's format and compression settings
+// Encode encodes a message using Protocol Buffers
 func (c *MessageCodec) Encode(msgType string, payload interface{}) ([]byte, error) {
-	if c.format == FormatProtobuf {
-		return c.encodeProtobuf(msgType, payload)
-	}
-	return c.encodeJSON(msgType, payload)
+	return c.encodeProtobuf(msgType, payload)
 }
 
-// Decode decodes a message, automatically detecting format
+// Decode decodes a protobuf message
 func (c *MessageCodec) Decode(data []byte) (string, []byte, error) {
-	format := detectMessageFormat(data)
-
-	if format == FormatProtobuf {
-		return c.decodeProtobuf(data)
-	}
-	return c.decodeJSON(data)
-}
-
-// encodeJSON encodes a message as JSON (DEPRECATED - will be removed in future versions)
-func (c *MessageCodec) encodeJSON(msgType string, payload interface{}) ([]byte, error) {
-	msg := Message{
-		Type: msgType,
-	}
-
-	if payload != nil {
-		payloadJSON, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
-		}
-		msg.Payload = payloadJSON
-	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return nil, fmt.Errorf("marshal message: %w", err)
-	}
-
-	if c.compressionEnabled {
-		return compressData(data)
-	}
-
-	return data, nil
-}
-
-// decodeJSON decodes a JSON message (DEPRECATED - will be removed in future versions)
-func (c *MessageCodec) decodeJSON(data []byte) (string, []byte, error) {
-	// Try to decompress if it looks compressed
-	if c.compressionEnabled && len(data) > 2 && data[0] == 0x1f && data[1] == 0x8b {
-		decompressed, err := decompressData(data)
-		if err == nil {
-			data = decompressed
-		}
-	}
-
-	var msg Message
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return "", nil, fmt.Errorf("unmarshal message: %w", err)
-	}
-
-	return msg.Type, msg.Payload, nil
+	return c.decodeProtobuf(data)
 }
 
 // encodeProtobuf encodes a message using Protocol Buffers
@@ -126,6 +49,9 @@ func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]by
 		}
 	}
 
+	// Log uncompressed payload size
+	uncompressedSize := len(payloadBytes)
+
 	// Compress payload if enabled
 	compressed := false
 	if c.compressionEnabled && len(payloadBytes) > 100 {
@@ -142,14 +68,26 @@ func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]by
 		Compressed: compressed,
 	}
 
-	return proto.Marshal(envelope)
+	envelopeBytes, err := proto.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("marshal envelope: %w", err)
+	}
+
+	// Log final size information
+	_ = uncompressedSize // Use the variable to avoid unused warning
+
+	return envelopeBytes, nil
 }
 
 // decodeProtobuf decodes a protobuf message
 func (c *MessageCodec) decodeProtobuf(data []byte) (string, []byte, error) {
+	if len(data) == 0 {
+		return "", nil, fmt.Errorf("empty data received")
+	}
+
 	envelope := &pb.Envelope{}
 	if err := proto.Unmarshal(data, envelope); err != nil {
-		return "", nil, fmt.Errorf("unmarshal envelope: %w", err)
+		return "", nil, fmt.Errorf("unmarshal envelope (received %d bytes): %w", len(data), err)
 	}
 
 	payloadBytes := envelope.Payload
@@ -195,6 +133,7 @@ func decompressData(data []byte) ([]byte, error) {
 // toProtoMessage converts Go structs to protobuf messages
 func toProtoMessage(payload interface{}) (proto.Message, error) {
 	switch p := payload.(type) {
+	// Pointer types (from pending actions)
 	case *CreateRoomPayload:
 		return &pb.CreateRoomPayload{Username: p.Username}, nil
 	case *JoinRoomPayload:
@@ -318,6 +257,106 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		return pbPayload, nil
 	case *SuggestionRejectedPayload:
 		return &pb.SuggestionRejectedPayload{SuggestionId: p.SuggestionID, Reason: p.Reason}, nil
+
+	// Value types (from sendMessage)
+	case RoomCreatedPayload:
+		return &pb.RoomCreatedPayload{
+			RoomCode:     p.RoomCode,
+			UserId:       p.UserID,
+			SessionToken: p.SessionToken,
+		}, nil
+	case JoinRequestPayload:
+		return &pb.JoinRequestPayload{UserId: p.UserID, Username: p.Username}, nil
+	case JoinApprovedPayload:
+		pbPayload := &pb.JoinApprovedPayload{
+			RoomCode:     p.RoomCode,
+			UserId:       p.UserID,
+			SessionToken: p.SessionToken,
+		}
+		if p.State != nil {
+			pbPayload.State = roomStateToProto(p.State)
+		}
+		return pbPayload, nil
+	case JoinRejectedPayload:
+		return &pb.JoinRejectedPayload{Reason: p.Reason}, nil
+	case UserJoinedPayload:
+		return &pb.UserJoinedPayload{UserId: p.UserID, Username: p.Username}, nil
+	case UserLeftPayload:
+		return &pb.UserLeftPayload{UserId: p.UserID, Username: p.Username}, nil
+	case BufferWaitPayload:
+		return &pb.BufferWaitPayload{TrackId: p.TrackID, WaitingFor: p.WaitingFor}, nil
+	case BufferCompletePayload:
+		return &pb.BufferCompletePayload{TrackId: p.TrackID}, nil
+	case ErrorPayload:
+		return &pb.ErrorPayload{Code: p.Code, Message: p.Message}, nil
+	case HostChangedPayload:
+		return &pb.HostChangedPayload{NewHostId: p.NewHostID, NewHostName: p.NewHostName}, nil
+	case KickedPayload:
+		return &pb.KickedPayload{Reason: p.Reason}, nil
+	case SyncStatePayload:
+		pbPayload := &pb.SyncStatePayload{
+			IsPlaying:  p.IsPlaying,
+			Position:   p.Position,
+			LastUpdate: p.LastUpdate,
+			Volume:     float32(p.Volume),
+		}
+		if p.CurrentTrack != nil {
+			pbPayload.CurrentTrack = trackInfoToProto(p.CurrentTrack)
+		}
+		return pbPayload, nil
+	case ReconnectedPayload:
+		pbPayload := &pb.ReconnectedPayload{
+			RoomCode: p.RoomCode,
+			UserId:   p.UserID,
+			IsHost:   p.IsHost,
+		}
+		if p.State != nil {
+			pbPayload.State = roomStateToProto(p.State)
+		}
+		return pbPayload, nil
+	case UserReconnectedPayload:
+		return &pb.UserReconnectedPayload{UserId: p.UserID, Username: p.Username}, nil
+	case UserDisconnectedPayload:
+		return &pb.UserDisconnectedPayload{UserId: p.UserID, Username: p.Username}, nil
+	case SuggestionReceivedPayload:
+		pbPayload := &pb.SuggestionReceivedPayload{
+			SuggestionId: p.SuggestionID,
+			FromUserId:   p.FromUserID,
+			FromUsername: p.FromUsername,
+		}
+		if p.TrackInfo != nil {
+			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
+		}
+		return pbPayload, nil
+	case SuggestionApprovedPayload:
+		pbPayload := &pb.SuggestionApprovedPayload{SuggestionId: p.SuggestionID}
+		if p.TrackInfo != nil {
+			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
+		}
+		return pbPayload, nil
+	case SuggestionRejectedPayload:
+		return &pb.SuggestionRejectedPayload{SuggestionId: p.SuggestionID, Reason: p.Reason}, nil
+	case PlaybackActionPayload:
+		pbPayload := &pb.PlaybackActionPayload{
+			Action:     p.Action,
+			TrackId:    p.TrackID,
+			Position:   p.Position,
+			InsertNext: p.InsertNext,
+			QueueTitle: p.QueueTitle,
+			Volume:     float32(p.Volume),
+			ServerTime: p.ServerTime,
+		}
+		if p.TrackInfo != nil {
+			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
+		}
+		if p.Queue != nil {
+			pbPayload.Queue = make([]*pb.TrackInfo, len(p.Queue))
+			for i, track := range p.Queue {
+				pbPayload.Queue[i] = trackInfoToProto(&track)
+			}
+		}
+		return pbPayload, nil
+
 	default:
 		return nil, fmt.Errorf("unsupported payload type: %T", payload)
 	}
@@ -481,65 +520,54 @@ func roomStateToProto(r *RoomState) *pb.RoomState {
 		}
 	}
 
-	if r.Queue != nil {
+	// Always initialize queue as non-nil (proto3 repeated fields should not be nil)
+	if r.Queue != nil && len(r.Queue) > 0 {
 		pbState.Queue = make([]*pb.TrackInfo, len(r.Queue))
 		for i, track := range r.Queue {
 			pbState.Queue[i] = trackInfoToProto(&track)
 		}
+	} else {
+		// Explicitly set to empty slice, not nil
+		pbState.Queue = []*pb.TrackInfo{}
 	}
 
 	return pbState
 }
 
-// Helper utility functions
-
-func formatToString(f MessageFormat) string {
-	if f == FormatProtobuf {
-		return "protobuf"
+// decodePayload decodes a protobuf payload into the target interface
+func decodePayload(payloadBytes []byte, msgType string, target interface{}) error {
+	// Use fromProtoMessage to convert protobuf to Go struct
+	payload, err := fromProtoMessage(msgType, payloadBytes)
+	if err != nil {
+		return err
 	}
-	return "json"
-}
-
-// decodePayload decodes a payload into the target interface based on format
-func decodePayload(payloadBytes []byte, format MessageFormat, msgType string, target interface{}) error {
-	if format == FormatProtobuf {
-		// Use fromProtoMessage to convert protobuf to Go struct
-		payload, err := fromProtoMessage(msgType, payloadBytes)
-		if err != nil {
-			return err
-		}
-		// Copy the decoded payload to target
-		// This is a bit hacky but works for our use case
-		targetVal := target
-		switch t := targetVal.(type) {
-		case *CreateRoomPayload:
-			*t = *payload.(*CreateRoomPayload)
-		case *JoinRoomPayload:
-			*t = *payload.(*JoinRoomPayload)
-		case *ApproveJoinPayload:
-			*t = *payload.(*ApproveJoinPayload)
-		case *RejectJoinPayload:
-			*t = *payload.(*RejectJoinPayload)
-		case *PlaybackActionPayload:
-			*t = *payload.(*PlaybackActionPayload)
-		case *BufferReadyPayload:
-			*t = *payload.(*BufferReadyPayload)
-		case *KickUserPayload:
-			*t = *payload.(*KickUserPayload)
-		case *SuggestTrackPayload:
-			*t = *payload.(*SuggestTrackPayload)
-		case *ApproveSuggestionPayload:
-			*t = *payload.(*ApproveSuggestionPayload)
-		case *RejectSuggestionPayload:
-			*t = *payload.(*RejectSuggestionPayload)
-		case *ReconnectPayload:
-			*t = *payload.(*ReconnectPayload)
-		default:
-			return fmt.Errorf("unsupported target type: %T", target)
-		}
-		return nil
+	// Copy the decoded payload to target
+	targetVal := target
+	switch t := targetVal.(type) {
+	case *CreateRoomPayload:
+		*t = *payload.(*CreateRoomPayload)
+	case *JoinRoomPayload:
+		*t = *payload.(*JoinRoomPayload)
+	case *ApproveJoinPayload:
+		*t = *payload.(*ApproveJoinPayload)
+	case *RejectJoinPayload:
+		*t = *payload.(*RejectJoinPayload)
+	case *PlaybackActionPayload:
+		*t = *payload.(*PlaybackActionPayload)
+	case *BufferReadyPayload:
+		*t = *payload.(*BufferReadyPayload)
+	case *KickUserPayload:
+		*t = *payload.(*KickUserPayload)
+	case *SuggestTrackPayload:
+		*t = *payload.(*SuggestTrackPayload)
+	case *ApproveSuggestionPayload:
+		*t = *payload.(*ApproveSuggestionPayload)
+	case *RejectSuggestionPayload:
+		*t = *payload.(*RejectSuggestionPayload)
+	case *ReconnectPayload:
+		*t = *payload.(*ReconnectPayload)
+	default:
+		return fmt.Errorf("unsupported target type: %T", target)
 	}
-
-	// JSON decode (DEPRECATED - will be removed in future versions)
-	return json.Unmarshal(payloadBytes, target)
+	return nil
 }
