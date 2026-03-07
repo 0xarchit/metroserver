@@ -144,6 +144,9 @@ func (s *Server) LoadState() error {
 		zap.Int("rooms", len(state.Rooms)),
 		zap.Int("sessions", len(state.Sessions)))
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// Restore rooms
 	for _, persistentRoom := range state.Rooms {
 		room := &Room{
