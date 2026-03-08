@@ -541,31 +541,81 @@ func decodePayload(payloadBytes []byte, msgType string, target interface{}) erro
 	if err != nil {
 		return err
 	}
-	// Copy the decoded payload to target
+	// Copy the decoded payload to target using safe type assertion
 	targetVal := target
 	switch t := targetVal.(type) {
 	case *CreateRoomPayload:
-		*t = *payload.(*CreateRoomPayload)
+		p, ok := payload.(*CreateRoomPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected CreateRoomPayload, got %T", payload)
+		}
+		*t = *p
 	case *JoinRoomPayload:
-		*t = *payload.(*JoinRoomPayload)
+		p, ok := payload.(*JoinRoomPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected JoinRoomPayload, got %T", payload)
+		}
+		*t = *p
 	case *ApproveJoinPayload:
-		*t = *payload.(*ApproveJoinPayload)
+		p, ok := payload.(*ApproveJoinPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected ApproveJoinPayload, got %T", payload)
+		}
+		*t = *p
 	case *RejectJoinPayload:
-		*t = *payload.(*RejectJoinPayload)
+		p, ok := payload.(*RejectJoinPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected RejectJoinPayload, got %T", payload)
+		}
+		*t = *p
 	case *PlaybackActionPayload:
-		*t = *payload.(*PlaybackActionPayload)
+		p, ok := payload.(*PlaybackActionPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected PlaybackActionPayload, got %T", payload)
+		}
+		*t = *p
 	case *BufferReadyPayload:
-		*t = *payload.(*BufferReadyPayload)
+		p, ok := payload.(*BufferReadyPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected BufferReadyPayload, got %T", payload)
+		}
+		*t = *p
 	case *KickUserPayload:
-		*t = *payload.(*KickUserPayload)
+		p, ok := payload.(*KickUserPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected KickUserPayload, got %T", payload)
+		}
+		*t = *p
 	case *SuggestTrackPayload:
-		*t = *payload.(*SuggestTrackPayload)
+		p, ok := payload.(*SuggestTrackPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected SuggestTrackPayload, got %T", payload)
+		}
+		*t = *p
 	case *ApproveSuggestionPayload:
-		*t = *payload.(*ApproveSuggestionPayload)
+		p, ok := payload.(*ApproveSuggestionPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected ApproveSuggestionPayload, got %T", payload)
+		}
+		*t = *p
 	case *RejectSuggestionPayload:
-		*t = *payload.(*RejectSuggestionPayload)
+		p, ok := payload.(*RejectSuggestionPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected RejectSuggestionPayload, got %T", payload)
+		}
+		*t = *p
 	case *ReconnectPayload:
-		*t = *payload.(*ReconnectPayload)
+		p, ok := payload.(*ReconnectPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected ReconnectPayload, got %T", payload)
+		}
+		*t = *p
+	case *TransferHostPayload:
+		p, ok := payload.(*TransferHostPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected TransferHostPayload, got %T", payload)
+		}
+		*t = *p
 	default:
 		return fmt.Errorf("unsupported target type: %T", target)
 	}

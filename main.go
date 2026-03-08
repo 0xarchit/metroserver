@@ -342,6 +342,7 @@ type Server struct {
 	clients   map[*Client]bool
 	upgrader  websocket.Upgrader
 	mu        sync.RWMutex
+	rngMu     sync.Mutex
 	logger    *zap.Logger
 	rng       *mathrand.Rand
 	startTime time.Time // Track when server started for room retention logic
@@ -458,14 +459,19 @@ func (s *Server) cleanupExpiredSessions() {
 func (s *Server) generateRoomCode() string {
 	const chars = "1234567890QWERTYUPASDFGHJLKZXCVBNM"
 	code := make([]byte, 8)
+	s.rngMu.Lock()
 	for i := range code {
 		code[i] = chars[s.rng.Intn(len(chars))]
 	}
+	s.rngMu.Unlock()
 	return string(code)
 }
 
 func (s *Server) generateUserID() string {
-	return fmt.Sprintf("user_%d_%d", time.Now().UnixNano(), s.rng.Intn(10000))
+	s.rngMu.Lock()
+	randNum := s.rng.Intn(10000)
+	s.rngMu.Unlock()
+	return fmt.Sprintf("user_%d_%d", time.Now().UnixNano(), randNum)
 }
 
 func (s *Server) generateSessionToken() string {
@@ -474,7 +480,10 @@ func (s *Server) generateSessionToken() string {
 	if _, err := rand.Read(b); err != nil {
 		s.logger.Error("Failed to generate secure token", zap.Error(err))
 		// Fallback to less secure but functional token
-		return fmt.Sprintf("token_%d_%d", time.Now().UnixNano(), s.rng.Intn(1000000))
+		s.rngMu.Lock()
+		tokenNum := s.rng.Intn(1000000)
+		s.rngMu.Unlock()
+		return fmt.Sprintf("token_%d_%d", time.Now().UnixNano(), tokenNum)
 	}
 	return hex.EncodeToString(b)
 }
@@ -515,7 +524,10 @@ func (c *Client) writePump(logger *zap.Logger) {
 	for {
 		select {
 		case message, ok := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				logger.Debug("Failed to set write deadline", zap.String("client_id", c.ID), zap.Error(err))
+				return
+			}
 			if !ok {
 				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
@@ -527,7 +539,10 @@ func (c *Client) writePump(logger *zap.Logger) {
 			}
 
 		case <-ticker.C:
-			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				logger.Debug("Failed to set write deadline", zap.String("client_id", c.ID), zap.Error(err))
+				return
+			}
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -542,9 +557,13 @@ func (c *Client) readPump(s *Server) {
 	}()
 
 	c.Conn.SetReadLimit(MaxReadMessageSize)
-	c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+	if err := c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+		s.logger.Debug("Failed to set read deadline", zap.String("client_id", c.ID), zap.Error(err))
+	}
 	c.Conn.SetPongHandler(func(string) error {
-		c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+		if err := c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+			s.logger.Debug("Failed to set read deadline in pong handler", zap.String("client_id", c.ID), zap.Error(err))
+		}
 		return nil
 	})
 
@@ -638,6 +657,14 @@ func (s *Server) handleClientDisconnect(c *Client) {
 
 	c.Room = nil
 
+	// Collect clients to notify before unlocking
+	clientsToNotify := make([]*Client, 0, len(room.Clients))
+	for _, client := range room.Clients {
+		if client != nil {
+			clientsToNotify = append(clientsToNotify, client)
+		}
+	}
+
 	// If room has no active clients and no disconnected users, delete it
 	if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
 		roomCode := room.Code
@@ -649,21 +676,15 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		return
 	}
 
-	// If host disconnected but there are other active clients, notify them
-	// Don't transfer host yet - wait for reconnection grace period
 	room.mu.Unlock()
 
 	// Notify other users about the temporary disconnect
-	room.mu.RLock()
-	for _, client := range room.Clients {
-		if client != nil {
-			client.sendMessage(s.logger, MsgTypeUserDisconnected, UserDisconnectedPayload{
-				UserID:   c.ID,
-				Username: username,
-			})
-		}
+	for _, client := range clientsToNotify {
+		client.sendMessage(s.logger, MsgTypeUserDisconnected, UserDisconnectedPayload{
+			UserID:   c.ID,
+			Username: username,
+		})
 	}
-	room.mu.RUnlock()
 
 	s.logger.Info("User temporarily disconnected",
 		zap.String("username", username),
@@ -1001,9 +1022,14 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 		})
 	}
 
+	trackID := ""
+	if suggestion.Track != nil {
+		trackID = suggestion.Track.ID
+	}
+
 	s.logger.Info("Suggestion approved",
 		zap.String("room_code", room.Code),
-		zap.String("track_id", suggestion.Track.ID))
+		zap.String("track_id", trackID))
 }
 
 func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
@@ -1046,9 +1072,14 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 		})
 	}
 
+	trackID := ""
+	if suggestion.Track != nil {
+		trackID = suggestion.Track.ID
+	}
+
 	s.logger.Info("Suggestion rejected",
 		zap.String("room_code", room.Code),
-		zap.String("track_id", suggestion.Track.ID))
+		zap.String("track_id", trackID))
 }
 
 func (s *Server) handleCreateRoom(c *Client, payload []byte) {
@@ -1755,6 +1786,15 @@ func (s *Server) handleKickUser(c *Client, payload []byte) {
 
 	kickedUsername := targetClient.Username
 	targetClient.Room = nil
+
+	// Collect clients to notify before unlocking
+	clientsToNotify := make([]*Client, 0, len(room.Clients))
+	for _, client := range room.Clients {
+		if client != nil {
+			clientsToNotify = append(clientsToNotify, client)
+		}
+	}
+
 	room.mu.Unlock()
 
 	// Notify the kicked user
@@ -1772,16 +1812,12 @@ func (s *Server) handleKickUser(c *Client, payload []byte) {
 	})
 
 	// Notify other users
-	room.mu.RLock()
-	for _, client := range room.Clients {
-		if client != nil {
-			client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-				UserID:   p.UserID,
-				Username: kickedUsername,
-			})
-		}
+	for _, client := range clientsToNotify {
+		client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
+			UserID:   p.UserID,
+			Username: kickedUsername,
+		})
 	}
-	room.mu.RUnlock()
 
 	s.logger.Info("User kicked from room",
 		zap.String("username", kickedUsername),
@@ -1968,26 +2004,37 @@ func (s *Server) leaveRoom(c *Client) {
 		}
 	}
 
+	// Collect clients and host info before unlocking
+	clientsToNotify := make([]*Client, 0, len(room.Clients))
+	for _, client := range room.Clients {
+		if client != nil {
+			clientsToNotify = append(clientsToNotify, client)
+		}
+	}
+	notifyHostChanged := wasHost && newHost != nil
+	hostID := ""
+	hostName := ""
+	if newHost != nil {
+		hostID = newHost.ID
+		hostName = newHost.Username
+	}
+
 	room.mu.Unlock()
 
 	// Notify other users
-	room.mu.RLock()
-	for _, client := range room.Clients {
-		if client != nil {
-			client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-				UserID:   c.ID,
-				Username: username,
-			})
+	for _, client := range clientsToNotify {
+		client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
+			UserID:   c.ID,
+			Username: username,
+		})
 
-			if wasHost && newHost != nil {
-				client.sendMessage(s.logger, MsgTypeHostChanged, HostChangedPayload{
-					NewHostID:   newHost.ID,
-					NewHostName: newHost.Username,
-				})
-			}
+		if notifyHostChanged {
+			client.sendMessage(s.logger, MsgTypeHostChanged, HostChangedPayload{
+				NewHostID:   hostID,
+				NewHostName: hostName,
+			})
 		}
 	}
-	room.mu.RUnlock()
 
 	s.logger.Info("User left room",
 		zap.String("username", username),
@@ -2036,7 +2083,8 @@ func main() {
 	// Initialize logger
 	logger, err := zap.NewProduction()
 	if err != nil {
-		panic(fmt.Sprintf("Failed to initialize logger: %v", err))
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
 	}
 	defer logger.Sync()
 
