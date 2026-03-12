@@ -38,9 +38,11 @@ jobs:
         run: |
           git remote add upstream https://github.com/MetrolistGroup/metroserver.git 2>/dev/null || true
           git fetch upstream
-          LOCAL=$(git rev-parse HEAD)
-          UPSTREAM=$(git rev-parse upstream/master)
-          if [ "$LOCAL" != "$UPSTREAM" ]; then
+          
+          # Check if upstream/master is ahead of our local HEAD
+          BEHIND=$(git rev-list --count HEAD..upstream/master)
+          
+          if [ "$BEHIND" -gt 0 ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
             git merge upstream/master --no-edit
             git submodule update --init --recursive
