@@ -809,6 +809,32 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		IsHost:   isHost,
 	})
 
+	if isHost {
+		room.mu.RLock()
+		pendingJoinRequests := make([]JoinRequestPayload, 0, len(room.PendingJoins))
+		for _, pendingClient := range room.PendingJoins {
+			if pendingClient == nil {
+				continue
+			}
+			pendingJoinRequests = append(pendingJoinRequests, JoinRequestPayload{
+				UserID:   pendingClient.ID,
+				Username: pendingClient.Username,
+			})
+		}
+		room.mu.RUnlock()
+
+		for _, joinRequest := range pendingJoinRequests {
+			c.sendMessage(s.logger, MsgTypeJoinRequest, joinRequest)
+		}
+
+		if len(pendingJoinRequests) > 0 {
+			s.logger.Info("Replayed pending join requests to reconnected host",
+				zap.String("host_id", c.ID),
+				zap.String("room_code", room.Code),
+				zap.Int("pending_count", len(pendingJoinRequests)))
+		}
+	}
+
 	// Notify other users
 	room.mu.RLock()
 	for _, client := range room.Clients {
@@ -1250,14 +1276,21 @@ func (s *Server) handleJoinRoom(c *Client, payload []byte) {
 
 	// Add to pending joins
 	room.PendingJoins[c.ID] = c
+	host := room.Host
+	hostConnected := host != nil && room.HostDisconnectedAt == nil
 	room.mu.Unlock()
 
-	// Notify host of join request - with nil check
-	if room.Host != nil {
-		room.Host.sendMessage(s.logger, MsgTypeJoinRequest, JoinRequestPayload{
+	// Notify host of join request if host is currently connected.
+	if hostConnected {
+		host.sendMessage(s.logger, MsgTypeJoinRequest, JoinRequestPayload{
 			UserID:   c.ID,
 			Username: c.Username,
 		})
+	} else {
+		s.logger.Info("Host unavailable, join request queued",
+			zap.String("username", c.Username),
+			zap.String("user_id", c.ID),
+			zap.String("room_code", p.RoomCode))
 	}
 
 	s.logger.Info("Join request received",
