@@ -1966,14 +1966,11 @@ func (s *Server) handleRequestSync(c *Client) {
 	// Calculate live position
 	currentPosition := room.State.Position
 	elapsed := time.Now().UnixMilli() - room.State.LastUpdate
-	if room.State.IsPlaying || (room.Host != nil && room.HostDisconnectedAt == nil) {
+	if room.State.IsPlaying {
 		currentPosition += elapsed
 	}
 
 	responsePlaying := room.State.IsPlaying
-	if room.Host != nil && room.HostDisconnectedAt == nil {
-		responsePlaying = true
-	}
 
 	s.logger.Debug("Sync request received",
 		zap.String("username", c.Username),
