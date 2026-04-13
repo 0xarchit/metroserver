@@ -785,12 +785,10 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	}
 
 	// Calculate live position for reconnect state
+	nowMs := time.Now().UnixMilli()
 	liveState := *room.State
-	if liveState.IsPlaying {
-		elapsed := time.Now().UnixMilli() - liveState.LastUpdate
-		liveState.Position += elapsed
-	}
-	liveState.LastUpdate = time.Now().UnixMilli()
+	liveState.Position = livePlaybackPosition(room.State, nowMs)
+	liveState.LastUpdate = nowMs
 
 	isHost := room.Host == c
 
@@ -884,6 +882,30 @@ func sanitizeString(s string, maxLen int) string {
 	}
 
 	return s
+}
+
+func livePlaybackPosition(state *RoomState, nowMs int64) int64 {
+	if state == nil {
+		return 0
+	}
+
+	position := state.Position
+	if position < 0 {
+		position = 0
+	}
+
+	if state.IsPlaying && state.LastUpdate > 0 {
+		elapsed := nowMs - state.LastUpdate
+		if elapsed > 0 {
+			position += elapsed
+		}
+	}
+
+	if state.CurrentTrack != nil && state.CurrentTrack.Duration > 0 && position > state.CurrentTrack.Duration {
+		return state.CurrentTrack.Duration
+	}
+
+	return position
 }
 
 func (s *Server) handleMessage(c *Client, data []byte) {
@@ -1362,15 +1384,16 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 
 	// If there is a current track, immediately send buffer-complete + seek (+ play if host is playing)
 	if room.State.CurrentTrack != nil {
+		syncPosition := livePlaybackPosition(room.State, time.Now().UnixMilli())
 		joiningClient.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: room.State.CurrentTrack.ID})
 		joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 			Action:   ActionSeek,
-			Position: room.State.Position,
+			Position: syncPosition,
 		})
 		if room.State.IsPlaying {
 			joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 				Action:   ActionPlay,
-				Position: room.State.Position,
+				Position: syncPosition,
 			})
 		}
 	}
@@ -1470,10 +1493,6 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		return
 	}
 
-	// Update room state based on action
-	prevLastUpdate := room.State.LastUpdate
-	room.State.LastUpdate = time.Now().UnixMilli()
-
 	switch p.Action {
 	case ActionPlay:
 		// Block play if no track is set
@@ -1482,21 +1501,44 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			c.sendError(s.logger, "no_track", "Cannot play without a track")
 			return
 		}
+		if p.Position < 0 {
+			c.sendError(s.logger, "invalid_position", "Position cannot be negative")
+			return
+		}
+		nowMs := time.Now().UnixMilli()
+		if room.State.CurrentTrack != nil && room.State.CurrentTrack.Duration > 0 && p.Position > room.State.CurrentTrack.Duration {
+			p.Position = room.State.CurrentTrack.Duration
+		}
 		room.State.IsPlaying = true
 		room.State.Position = p.Position
-		p.ServerTime = time.Now().UnixMilli()
+		room.State.LastUpdate = nowMs
+		p.ServerTime = nowMs
 
 	case ActionPause:
 		// Pause is always allowed
+		if p.Position < 0 {
+			c.sendError(s.logger, "invalid_position", "Position cannot be negative")
+			return
+		}
+		nowMs := time.Now().UnixMilli()
+		if room.State.CurrentTrack != nil && room.State.CurrentTrack.Duration > 0 && p.Position > room.State.CurrentTrack.Duration {
+			p.Position = room.State.CurrentTrack.Duration
+		}
 		room.State.IsPlaying = false
 		room.State.Position = p.Position
+		room.State.LastUpdate = nowMs
 
 	case ActionSeek:
 		if p.Position < 0 {
 			c.sendError(s.logger, "invalid_position", "Position cannot be negative")
 			return
 		}
+		nowMs := time.Now().UnixMilli()
+		if room.State.CurrentTrack != nil && room.State.CurrentTrack.Duration > 0 && p.Position > room.State.CurrentTrack.Duration {
+			p.Position = room.State.CurrentTrack.Duration
+		}
 		room.State.Position = p.Position
+		room.State.LastUpdate = nowMs
 
 	case ActionChangeTrack:
 		if p.TrackInfo == nil {
@@ -1525,6 +1567,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		room.State.CurrentTrack = p.TrackInfo
 		room.State.Position = 0
 		room.State.IsPlaying = false
+		room.State.LastUpdate = time.Now().UnixMilli()
 
 		// For new tracks, always start at position 0
 		room.HostStartPosition = 0
@@ -1570,6 +1613,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 
 	case ActionSkipNext, ActionSkipPrev:
 		room.State.Position = 0
+		room.State.LastUpdate = time.Now().UnixMilli()
 
 	case ActionQueueAdd:
 		if p.TrackInfo == nil {
@@ -1660,7 +1704,6 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			return
 		}
 		room.State.Volume = p.Volume
-		room.State.LastUpdate = prevLastUpdate
 
 	default:
 		c.sendError(s.logger, "unknown_action", fmt.Sprintf("Unknown action: %s", p.Action))
@@ -1712,16 +1755,17 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 	// If buffering is disabled for this room, respond per-client so late buffer_ready still receives SEEK/PLAY
 	if room.BufferingUsers == nil {
 		s.logger.Debug("Buffering disabled for room - per-client ACK", zap.String("room_code", room.Code), zap.String("user_id", c.ID))
+		syncPosition := livePlaybackPosition(room.State, time.Now().UnixMilli())
 		// Send buffer-complete and sync to this specific client so they will apply seek/play
 		c.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: p.TrackID})
 		c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 			Action:   ActionSeek,
-			Position: room.State.Position,
+			Position: syncPosition,
 		})
 		if room.State.IsPlaying {
 			c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 				Action:   ActionPlay,
-				Position: room.State.Position,
+				Position: syncPosition,
 			})
 		}
 		return
@@ -1964,16 +2008,14 @@ func (s *Server) handleRequestSync(c *Client) {
 	defer room.mu.RUnlock()
 
 	// Calculate live position
-	currentPosition := room.State.Position
-	elapsed := time.Now().UnixMilli() - room.State.LastUpdate
-	if room.State.IsPlaying || (room.Host != nil && room.HostDisconnectedAt == nil) {
-		currentPosition += elapsed
+	nowMs := time.Now().UnixMilli()
+	currentPosition := livePlaybackPosition(room.State, nowMs)
+	elapsed := int64(0)
+	if room.State.IsPlaying && currentPosition > room.State.Position {
+		elapsed = currentPosition - room.State.Position
 	}
 
 	responsePlaying := room.State.IsPlaying
-	if room.Host != nil && room.HostDisconnectedAt == nil {
-		responsePlaying = true
-	}
 
 	s.logger.Debug("Sync request received",
 		zap.String("username", c.Username),
@@ -1988,7 +2030,7 @@ func (s *Server) handleRequestSync(c *Client) {
 		CurrentTrack: room.State.CurrentTrack,
 		IsPlaying:    responsePlaying,
 		Position:     currentPosition,
-		LastUpdate:   time.Now().UnixMilli(),
+		LastUpdate:   nowMs,
 		Volume:       room.State.Volume,
 	})
 }
