@@ -258,11 +258,12 @@ type HostChangedPayload struct {
 
 // SyncStatePayload is sent to a guest when they request current playback state
 type SyncStatePayload struct {
-	CurrentTrack *TrackInfo `json:"current_track,omitempty"`
-	IsPlaying    bool       `json:"is_playing"`
-	Position     int64      `json:"position"`    // milliseconds
-	LastUpdate   int64      `json:"last_update"` // unix timestamp ms
-	Volume       float64    `json:"volume"`
+	CurrentTrack *TrackInfo  `json:"current_track,omitempty"`
+	IsPlaying    bool        `json:"is_playing"`
+	Position     int64       `json:"position"`    // milliseconds
+	LastUpdate   int64       `json:"last_update"` // unix timestamp ms
+	Volume       float64     `json:"volume"`
+	Queue        []TrackInfo `json:"queue,omitempty"`
 }
 
 // ReconnectPayload is for reconnecting to a room
@@ -1385,14 +1386,17 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 	// If there is a current track, immediately send buffer-complete + seek (+ play if host is playing)
 	if room.State.CurrentTrack != nil {
 		syncPosition := livePlaybackPosition(room.State, time.Now().UnixMilli())
-		joiningClient.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: room.State.CurrentTrack.ID})
+		trackID := room.State.CurrentTrack.ID
+		joiningClient.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: trackID})
 		joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 			Action:   ActionSeek,
+			TrackID:  trackID,
 			Position: syncPosition,
 		})
 		if room.State.IsPlaying {
 			joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 				Action:   ActionPlay,
+				TrackID:  trackID,
 				Position: syncPosition,
 			})
 		}
@@ -1513,6 +1517,9 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		room.State.Position = p.Position
 		room.State.LastUpdate = nowMs
 		p.ServerTime = nowMs
+		if p.TrackID == "" && room.State.CurrentTrack != nil {
+			p.TrackID = room.State.CurrentTrack.ID
+		}
 
 	case ActionPause:
 		// Pause is always allowed
@@ -1527,6 +1534,9 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		room.State.IsPlaying = false
 		room.State.Position = p.Position
 		room.State.LastUpdate = nowMs
+		if p.TrackID == "" && room.State.CurrentTrack != nil {
+			p.TrackID = room.State.CurrentTrack.ID
+		}
 
 	case ActionSeek:
 		if p.Position < 0 {
@@ -1539,6 +1549,9 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		}
 		room.State.Position = p.Position
 		room.State.LastUpdate = nowMs
+		if p.TrackID == "" && room.State.CurrentTrack != nil {
+			p.TrackID = room.State.CurrentTrack.ID
+		}
 
 	case ActionChangeTrack:
 		if p.TrackInfo == nil {
@@ -1586,6 +1599,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 				// Ensure everyone is paused at position 0 during transition
 				client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 					Action:   ActionPause,
+					TrackID:  p.TrackInfo.ID,
 					Position: 0,
 				})
 
@@ -1597,6 +1611,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 				// Seek everyone to the new start position (0)
 				client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 					Action:   ActionSeek,
+					TrackID:  p.TrackInfo.ID,
 					Position: 0,
 				})
 
@@ -1604,6 +1619,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 				if room.State.IsPlaying {
 					client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 						Action:   ActionPlay,
+						TrackID:  p.TrackInfo.ID,
 						Position: 0,
 					})
 				}
@@ -1756,15 +1772,21 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 	if room.BufferingUsers == nil {
 		s.logger.Debug("Buffering disabled for room - per-client ACK", zap.String("room_code", room.Code), zap.String("user_id", c.ID))
 		syncPosition := livePlaybackPosition(room.State, time.Now().UnixMilli())
+		syncTrackID := p.TrackID
+		if room.State.CurrentTrack != nil && room.State.CurrentTrack.ID != "" {
+			syncTrackID = room.State.CurrentTrack.ID
+		}
 		// Send buffer-complete and sync to this specific client so they will apply seek/play
-		c.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: p.TrackID})
+		c.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: syncTrackID})
 		c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 			Action:   ActionSeek,
+			TrackID:  syncTrackID,
 			Position: syncPosition,
 		})
 		if room.State.IsPlaying {
 			c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 				Action:   ActionPlay,
+				TrackID:  syncTrackID,
 				Position: syncPosition,
 			})
 		}
@@ -1775,6 +1797,10 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 	if len(room.BufferingUsers) == 0 {
 		// All users ready - sync everyone to position 0 for new track
 		syncPosition := int64(0)
+		syncTrackID := p.TrackID
+		if room.State.CurrentTrack != nil && room.State.CurrentTrack.ID != "" {
+			syncTrackID = room.State.CurrentTrack.ID
+		}
 		room.State.Position = syncPosition
 		room.State.LastUpdate = time.Now().UnixMilli()
 
@@ -1786,12 +1812,13 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 			if client != nil {
 				// Step 1: Send buffer complete notification
 				client.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{
-					TrackID: p.TrackID,
+					TrackID: syncTrackID,
 				})
 
 				// Step 2: SEEK everyone to exact position
 				client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 					Action:   ActionSeek,
+					TrackID:  syncTrackID,
 					Position: syncPosition,
 				})
 
@@ -1799,6 +1826,7 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 				if room.State.IsPlaying {
 					client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
 						Action:   ActionPlay,
+						TrackID:  syncTrackID,
 						Position: syncPosition,
 					})
 				}
@@ -2031,6 +2059,7 @@ func (s *Server) handleRequestSync(c *Client) {
 		IsPlaying:    responsePlaying,
 		Position:     currentPosition,
 		LastUpdate:   nowMs,
+		Queue:        room.State.Queue,
 		Volume:       room.State.Volume,
 	})
 }

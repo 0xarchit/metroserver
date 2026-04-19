@@ -224,6 +224,12 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		if p.CurrentTrack != nil {
 			pbPayload.CurrentTrack = trackInfoToProto(p.CurrentTrack)
 		}
+		if p.Queue != nil {
+			pbPayload.Queue = make([]*pb.TrackInfo, len(p.Queue))
+			for i, track := range p.Queue {
+				pbPayload.Queue[i] = trackInfoToProto(&track)
+			}
+		}
 		return pbPayload, nil
 	case *ReconnectedPayload:
 		pbPayload := &pb.ReconnectedPayload{
@@ -302,6 +308,12 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		}
 		if p.CurrentTrack != nil {
 			pbPayload.CurrentTrack = trackInfoToProto(p.CurrentTrack)
+		}
+		if p.Queue != nil {
+			pbPayload.Queue = make([]*pb.TrackInfo, len(p.Queue))
+			for i, track := range p.Queue {
+				pbPayload.Queue[i] = trackInfoToProto(&track)
+			}
 		}
 		return pbPayload, nil
 	case ReconnectedPayload:
