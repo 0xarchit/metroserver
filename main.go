@@ -325,6 +325,7 @@ type Room struct {
 	BufferingUsers     map[string]bool // Track which users are still buffering
 	HostStartPosition  int64           // Host's position when buffering started
 	HostDisconnectedAt *time.Time      // When the host disconnected (nil if connected)
+	EmptySince         *time.Time      // When the room became empty (nil if not empty)
 	mu                 sync.RWMutex
 }
 
@@ -338,15 +339,16 @@ type Suggestion struct {
 
 // Server is the main WebSocket server
 type Server struct {
-	rooms     map[string]*Room
-	sessions  map[string]*Session // sessionToken -> Session
-	clients   map[*Client]bool
-	upgrader  websocket.Upgrader
-	mu        sync.RWMutex
-	rngMu     sync.Mutex
-	logger    *zap.Logger
-	rng       *mathrand.Rand
-	startTime time.Time // Track when server started for room retention logic
+	rooms      map[string]*Room
+	sessions   map[string]*Session // sessionToken -> Session
+	clients    map[*Client]bool
+	userAgents map[string]int // user agent -> count
+	upgrader   websocket.Upgrader
+	mu         sync.RWMutex
+	rngMu      sync.Mutex
+	logger     *zap.Logger
+	rng        *mathrand.Rand
+	startTime  time.Time // Track when server started for room retention logic
 }
 
 const (
@@ -354,6 +356,10 @@ const (
 	ReconnectGracePeriod = 15 * time.Minute
 	// How often to clean up expired sessions
 	SessionCleanupInterval = 1 * time.Minute
+	// How long to keep empty rooms before deleting them
+	EmptyRoomCleanupTimeout = 5 * time.Minute
+	// How often to check for empty rooms
+	EmptyRoomCleanupInterval = 30 * time.Second
 	// Minimum time to keep empty rooms after server restart (for reconnection)
 	MinRoomRetentionAfterRestart = 2 * time.Minute
 	// Security limits
@@ -371,9 +377,10 @@ const (
 
 func NewServer(logger *zap.Logger) *Server {
 	s := &Server{
-		rooms:    make(map[string]*Room),
-		sessions: make(map[string]*Session),
-		clients:  make(map[*Client]bool),
+		rooms:      make(map[string]*Room),
+		sessions:   make(map[string]*Session),
+		clients:    make(map[*Client]bool),
+		userAgents: make(map[string]int),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for mobile app
@@ -388,6 +395,7 @@ func NewServer(logger *zap.Logger) *Server {
 
 	// Start cleanup goroutines
 	go s.cleanupExpiredSessions()
+	go s.cleanupEmptyRooms()
 
 	return s
 }
@@ -473,6 +481,55 @@ func (s *Server) cleanupExpiredSessions() {
 	}
 }
 
+func (s *Server) cleanupEmptyRooms() {
+	// Wait 5 minutes before first cleanup to avoid deleting rooms during startup
+	time.Sleep(EmptyRoomCleanupTimeout)
+
+	ticker := time.NewTicker(EmptyRoomCleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+		minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
+
+		s.mu.Lock()
+		for roomCode, room := range s.rooms {
+			if room == nil {
+				continue
+			}
+
+			room.mu.RLock()
+			isEmpty := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0
+			emptySince := room.EmptySince
+			room.mu.RUnlock()
+
+			if !isEmpty {
+				continue
+			}
+
+			// If room just became empty, mark it
+			if emptySince == nil {
+				room.mu.Lock()
+				nowPtr := now
+				room.EmptySince = &nowPtr
+				room.mu.Unlock()
+				s.logger.Info("Room became empty, scheduling cleanup",
+					zap.String("room_code", roomCode))
+				continue
+			}
+
+			// Check if room has been empty long enough and past retention window
+			if now.Sub(*emptySince) > EmptyRoomCleanupTimeout && now.After(minRetentionTime) {
+				delete(s.rooms, roomCode)
+				s.logger.Info("Deleted empty room after inactivity",
+					zap.String("room_code", roomCode),
+					zap.Duration("empty_for", now.Sub(*emptySince)))
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
 func (s *Server) generateRoomCode() string {
 	const chars = "1234567890QWERTYUPASDFGHJLKZXCVBNM"
 	code := make([]byte, 8)
@@ -510,6 +567,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Warn("WebSocket upgrade error", zap.Error(err))
 		return
+	}
+
+	// Track user agent
+	ua := r.UserAgent()
+	if ua != "" {
+		s.mu.Lock()
+		s.userAgents[ua]++
+		s.mu.Unlock()
 	}
 
 	// Use Protobuf codec with compression enabled
@@ -682,14 +747,13 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		}
 	}
 
-	// If room has no active clients and no disconnected users, delete it
+	// If room has no active clients and no disconnected users, mark it as empty
 	if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
-		roomCode := room.Code
+		now := time.Now()
+		room.EmptySince = &now
 		room.mu.Unlock()
-		s.mu.Lock()
-		delete(s.rooms, roomCode)
-		s.mu.Unlock()
-		s.logger.Info("Room deleted (empty)", zap.String("room_code", roomCode))
+		s.logger.Info("Room became empty",
+			zap.String("room_code", room.Code))
 		return
 	}
 
@@ -765,6 +829,7 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	// Add back to room clients
 	room.Clients[c.ID] = c
 	delete(room.DisconnectedUsers, c.ID)
+	room.EmptySince = nil
 
 	// Mark user as connected in room state
 	for i := range room.State.Users {
@@ -1366,6 +1431,9 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 	room.Clients[joiningClient.ID] = joiningClient
 	joiningClient.Room = room
 	joiningClient.SessionToken = s.generateSessionToken()
+
+	// Clear empty status since room is no longer empty
+	room.EmptySince = nil
 
 	// Update room state
 	room.State.Users = append(room.State.Users, UserInfo{
@@ -2098,14 +2166,13 @@ func (s *Server) leaveRoom(c *Client) {
 
 	c.Room = nil
 
-	// If room is empty (no active or disconnected users), delete it
+	// If room is empty (no active or disconnected users), mark it as empty
 	if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
-		roomCode := room.Code
+		now := time.Now()
+		room.EmptySince = &now
 		room.mu.Unlock()
-		s.mu.Lock()
-		delete(s.rooms, roomCode)
-		s.mu.Unlock()
-		s.logger.Info("Room deleted (empty)", zap.String("room_code", roomCode))
+		s.logger.Info("Room became empty",
+			zap.String("room_code", room.Code))
 		return
 	}
 
@@ -2238,6 +2305,17 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	http.HandleFunc("/uas", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		server.mu.RLock()
+		uas := make(map[string]int, len(server.userAgents))
+		for k, v := range server.userAgents {
+			uas[k] = v
+		}
+		server.mu.RUnlock()
+		json.NewEncoder(w).Encode(uas)
 	})
 
 	port := os.Getenv("PORT")
