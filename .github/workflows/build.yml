@@ -14,6 +14,40 @@ env:
     IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+    test:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            id-token: write
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  submodules: recursive
+
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.25.6"
+                  cache: true
+
+            - name: Run tests with coverage
+              run: go test -race -covermode=atomic -coverprofile=coverage.out .
+
+            - name: Enforce 80% coverage
+              run: |
+                  coverage=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')
+                  echo "Coverage: ${coverage}%"
+                  awk -v coverage="$coverage" 'BEGIN { if (coverage < 80) exit 1 }'
+
+            - name: Upload coverage to Codecov
+              uses: codecov/codecov-action@v5
+              with:
+                  files: ./coverage.out
+                  fail_ci_if_error: true
+                  use_oidc: true
+
     build:
         runs-on: ubuntu-latest
         permissions:
@@ -70,7 +104,7 @@ jobs:
                   submodules: recursive
 
             - name: Set up Go
-              uses: actions/setup-go@v4
+              uses: actions/setup-go@v5
               with:
                   go-version: "1.25.6"
 
@@ -108,4 +142,3 @@ jobs:
                   context: .
                   push: false
                   cache-from: type=gha
-

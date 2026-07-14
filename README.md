@@ -1,5 +1,7 @@
 # Metroserver
 
+[![codecov](https://codecov.io/gh/MetrolistGroup/metroserver/graph/badge.svg)](https://codecov.io/gh/MetrolistGroup/metroserver)
+
 A high performance Go WebSocket server for Metrolist's "Listen Together" feature.  
 Utilizes protobuf and gzip compression for fast and efficient communication between clients.
 
