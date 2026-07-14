@@ -143,12 +143,12 @@ func TestCompressionHelpers(t *testing.T) {
 func TestToProtoMessageVariants(t *testing.T) {
 	track := TrackInfo{ID: "track", Title: "title", Artist: "artist", Album: "album", Duration: 123, Thumbnail: "thumb", SuggestedBy: "user"}
 	pbTrack := &pb.TrackInfo{Id: "track", Title: "title", Artist: "artist", Album: "album", Duration: 123, Thumbnail: "thumb", SuggestedBy: "user"}
-	state := RoomState{RoomCode: "ROOM", HostID: "host", Users: []UserInfo{{UserID: "host", Username: "Host", IsHost: true, IsConnected: true}}, CurrentTrack: &track, IsPlaying: true, Position: 10, LastUpdate: 20, Volume: .75, Queue: []TrackInfo{track}}
+	state := RoomState{RoomCode: "ROOM", HostID: "host", Users: []UserInfo{{UserID: "host", Username: "Host", IsHost: true, IsConnected: true}}, CurrentTrack: &track, IsPlaying: true, Position: 10, LastUpdate: 20, Volume: .75, Queue: []TrackInfo{track}, Revision: 4}
 	pbState := roomStateToProto(&state)
-	playback := PlaybackActionPayload{Action: ActionChangeTrack, TrackID: "track", Position: 10, TrackInfo: &track, InsertNext: true, Queue: []TrackInfo{track}, QueueTitle: "queue", Volume: .75, ServerTime: 20}
-	pbPlayback := &pb.PlaybackActionPayload{Action: ActionChangeTrack, TrackId: "track", Position: 10, TrackInfo: pbTrack, InsertNext: true, Queue: []*pb.TrackInfo{pbTrack}, QueueTitle: "queue", Volume: .75, ServerTime: 20}
-	syncState := SyncStatePayload{CurrentTrack: &track, IsPlaying: true, Position: 10, LastUpdate: 20, Volume: .75, Queue: []TrackInfo{track}}
-	pbSyncState := &pb.SyncStatePayload{CurrentTrack: pbTrack, IsPlaying: true, Position: 10, LastUpdate: 20, Volume: .75, Queue: []*pb.TrackInfo{pbTrack}}
+	playback := PlaybackActionPayload{Action: ActionChangeTrack, TrackID: "track", Position: 10, TrackInfo: &track, InsertNext: true, Queue: []TrackInfo{track}, QueueTitle: "queue", Volume: .75, ServerTime: 20, Revision: 4, CapturedAtServerTime: 15}
+	pbPlayback := &pb.PlaybackActionPayload{Action: ActionChangeTrack, TrackId: "track", Position: 10, TrackInfo: pbTrack, InsertNext: true, Queue: []*pb.TrackInfo{pbTrack}, QueueTitle: "queue", Volume: .75, ServerTime: 20, Revision: 4, CapturedAtServerTime: 15}
+	syncState := SyncStatePayload{CurrentTrack: &track, IsPlaying: true, Position: 10, LastUpdate: 20, Volume: .75, Queue: []TrackInfo{track}, Revision: 4}
+	pbSyncState := &pb.SyncStatePayload{CurrentTrack: pbTrack, IsPlaying: true, Position: 10, LastUpdate: 20, Volume: .75, Queue: []*pb.TrackInfo{pbTrack}, Revision: 4}
 
 	tests := []struct {
 		name    string
@@ -161,6 +161,8 @@ func TestToProtoMessageVariants(t *testing.T) {
 		{"reject join pointer", &RejectJoinPayload{UserID: "user", Reason: "reason"}, &pb.RejectJoinPayload{UserId: "user", Reason: "reason"}},
 		{"playback pointer", &playback, pbPlayback},
 		{"buffer ready pointer", &BufferReadyPayload{TrackID: "track"}, &pb.BufferReadyPayload{TrackId: "track"}},
+		{"ping pointer", &PingPayload{ClientTime: 10, Sequence: 2}, &pb.PingPayload{ClientTime: 10, Sequence: 2}},
+		{"pong pointer", &PongPayload{ClientTime: 10, ServerReceiveTime: 20, ServerSendTime: 21, Sequence: 2}, &pb.PongPayload{ClientTime: 10, ServerReceiveTime: 20, ServerSendTime: 21, Sequence: 2}},
 		{"kick user pointer", &KickUserPayload{UserID: "user", Reason: "reason"}, &pb.KickUserPayload{UserId: "user", Reason: "reason"}},
 		{"transfer host pointer", &TransferHostPayload{NewHostID: "user"}, &pb.TransferHostPayload{NewHostId: "user"}},
 		{"suggest track pointer", &SuggestTrackPayload{TrackInfo: &track}, &pb.SuggestTrackPayload{TrackInfo: pbTrack}},
@@ -207,6 +209,8 @@ func TestToProtoMessageVariants(t *testing.T) {
 		{"suggestion approved value", SuggestionApprovedPayload{SuggestionID: "suggestion", TrackInfo: &track}, &pb.SuggestionApprovedPayload{SuggestionId: "suggestion", TrackInfo: pbTrack}},
 		{"suggestion rejected value", SuggestionRejectedPayload{SuggestionID: "suggestion", Reason: "reason"}, &pb.SuggestionRejectedPayload{SuggestionId: "suggestion", Reason: "reason"}},
 		{"playback value", playback, pbPlayback},
+		{"ping value", PingPayload{ClientTime: 10, Sequence: 2}, &pb.PingPayload{ClientTime: 10, Sequence: 2}},
+		{"pong value", PongPayload{ClientTime: 10, ServerReceiveTime: 20, ServerSendTime: 21, Sequence: 2}, &pb.PongPayload{ClientTime: 10, ServerReceiveTime: 20, ServerSendTime: 21, Sequence: 2}},
 		{"server capabilities value", ServerCapabilitiesPayload{SupportsProtobuf: true, SupportsCompression: true, ServerVersion: "1"}, &pb.ServerCapabilities{SupportsProtobuf: true, SupportsCompression: true, ServerVersion: "1"}},
 	}
 

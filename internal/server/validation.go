@@ -106,3 +106,13 @@ func livePlaybackPosition(state *RoomState, nowMs int64) int64 {
 
 	return position
 }
+
+func cloneLiveRoomState(state *RoomState, nowMs int64) *RoomState {
+	copyState := cloneRoomState(state)
+	if copyState == nil {
+		return nil
+	}
+	copyState.Position = livePlaybackPosition(state, nowMs)
+	copyState.LastUpdate = nowMs
+	return copyState
+}

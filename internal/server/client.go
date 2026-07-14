@@ -201,6 +201,14 @@ func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interfa
 		zap.String("payload_type", fmt.Sprintf("%T", payload)),
 		zap.Int("encoded_size_bytes", len(msgData)))
 
+	c.sendEncodedMessage(logger, msgType, msgData)
+}
+
+func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData []byte) {
+	if c == nil || c.Send == nil {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -216,6 +224,21 @@ func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interfa
 		logger.Warn("Client send buffer full; closing slow client", zap.String("client_id", c.clientID()))
 		c.closed = true
 		close(c.Send)
+	}
+}
+
+func sendMessageToClients(logger *zap.Logger, clients []*Client, msgType string, payload interface{}) {
+	if len(clients) == 0 {
+		return
+	}
+
+	msgData, err := NewMessageCodec(true).Encode(msgType, payload)
+	if err != nil {
+		logger.Error("Error encoding broadcast", zap.String("message_type", msgType), zap.Error(err))
+		return
+	}
+	for _, client := range clients {
+		client.sendEncodedMessage(logger, msgType, msgData)
 	}
 }
 

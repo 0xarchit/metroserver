@@ -102,6 +102,8 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
 	room.mu.Lock()
 	defer room.mu.Unlock()
 	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
@@ -120,6 +122,11 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 			c.sendError(s.logger, "queue_full", "Queue is full")
 			return
 		}
+		if (room.State.CurrentTrack != nil && room.State.CurrentTrack.ID == suggestion.Track.ID) ||
+			containsTrackID(room.State.Queue, suggestion.Track.ID) {
+			c.sendError(s.logger, "duplicate_track", "Track is already playing or queued")
+			return
+		}
 		suggestion.Track.SuggestedBy = suggestion.FromUsername
 		room.State.Queue = append([]TrackInfo{*suggestion.Track}, room.State.Queue...)
 	}
@@ -132,7 +139,11 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 		Action:     ActionQueueAdd,
 		TrackInfo:  suggestion.Track,
 		InsertNext: true,
+		Queue:      append([]TrackInfo(nil), room.State.Queue...),
+		ServerTime: time.Now().UnixMilli(),
 	}
+	room.State.Revision++
+	qa.Revision = room.State.Revision
 	for _, client := range room.Clients {
 		if client != nil {
 			client.sendMessage(s.logger, MsgTypeSyncPlayback, qa)
@@ -441,16 +452,19 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 		return
 	}
 
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
 	room.mu.Lock()
-	defer room.mu.Unlock()
 
 	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
+		room.mu.Unlock()
 		c.sendError(s.logger, "not_host", "Only the host can approve join requests")
 		return
 	}
 
 	joiningClient, exists := room.PendingJoins[p.UserID]
 	if !exists {
+		room.mu.Unlock()
 		c.sendError(s.logger, "join_request_not_found", "Join request not found")
 		return
 	}
@@ -458,10 +472,12 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 	// Verify joining client is still valid
 	if joiningClient == nil || joiningClient.isClosed() {
 		delete(room.PendingJoins, p.UserID)
+		room.mu.Unlock()
 		c.sendError(s.logger, "user_disconnected", "User has disconnected")
 		return
 	}
 	if len(room.Clients) >= MaxClientsPerRoom {
+		room.mu.Unlock()
 		c.sendError(s.logger, "room_full", "Room is full")
 		return
 	}
@@ -487,42 +503,26 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 		IsConnected: true,
 	})
 
-	// Send approval to the joining user
-	joiningClient.sendMessage(s.logger, MsgTypeJoinApproved, JoinApprovedPayload{
+	nowMs := time.Now().UnixMilli()
+	approval := JoinApprovedPayload{
 		RoomCode:     room.Code,
 		UserID:       joiningID,
 		SessionToken: joiningToken,
-		State:        cloneRoomState(room.State),
-	})
-
-	// If there is a current track, immediately send buffer-complete + seek (+ play if host is playing)
-	if room.State.CurrentTrack != nil {
-		syncPosition := livePlaybackPosition(room.State, time.Now().UnixMilli())
-		trackID := room.State.CurrentTrack.ID
-		joiningClient.sendMessage(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: trackID})
-		joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
-			Action:   ActionSeek,
-			TrackID:  trackID,
-			Position: syncPosition,
-		})
-		if room.State.IsPlaying {
-			joiningClient.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
-				Action:   ActionPlay,
-				TrackID:  trackID,
-				Position: syncPosition,
-			})
-		}
+		State:        cloneLiveRoomState(room.State, nowMs),
 	}
 
-	// Notify all other users
+	clientsToNotify := make([]*Client, 0, len(room.Clients)-1)
 	for _, client := range room.Clients {
 		if client != nil && client.clientID() != joiningID {
-			client.sendMessage(s.logger, MsgTypeUserJoined, UserJoinedPayload{
-				UserID:   joiningID,
-				Username: joiningUsername,
-			})
+			clientsToNotify = append(clientsToNotify, client)
 		}
 	}
+	room.mu.Unlock()
+
+	joiningClient.sendMessage(s.logger, MsgTypeJoinApproved, approval)
+	sendMessageToClients(s.logger, clientsToNotify, MsgTypeUserJoined, UserJoinedPayload{
+		UserID: joiningID, Username: joiningUsername,
+	})
 
 	s.logger.Info("User approved to join room",
 		zap.String("username", joiningUsername),

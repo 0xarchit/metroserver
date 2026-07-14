@@ -1,15 +1,18 @@
 package server
 
 import (
+	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"regexp"
+	"sync"
 	"testing"
 	"time"
 
 	pb "github.com/MetrolistGroup/metroserver/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 func playbackTestRoom() (*Server, *Client, *Client, *Room) {
@@ -69,8 +72,6 @@ func TestPlaybackActionRemainingPositionAndVolumeBranches(t *testing.T) {
 	}{
 		{name: "pause clamps", payload: PlaybackActionPayload{Action: ActionPause, Position: 1200}, playing: true, wantPosition: 1000, wantBroadcast: 1000, wantVolume: 0.5},
 		{name: "seek clamps and fills track ID", payload: PlaybackActionPayload{Action: ActionSeek, Position: 1200}, playing: true, wantPosition: 1000, wantBroadcast: 1000, wantVolume: 0.5},
-		{name: "skip next", payload: PlaybackActionPayload{Action: ActionSkipNext, Position: 900}, playing: true, wantPosition: 0, wantBroadcast: 900, wantVolume: 0.5},
-		{name: "skip previous", payload: PlaybackActionPayload{Action: ActionSkipPrev, Position: 900}, playing: true, wantPosition: 0, wantBroadcast: 900, wantVolume: 0.5},
 		{name: "set volume", payload: PlaybackActionPayload{Action: ActionSetVolume, Volume: 0.75}, playing: false, wantPosition: 0, wantVolume: 0.75},
 	}
 
@@ -130,17 +131,64 @@ func TestPlaybackActionChangeTrackSendsTransitionSequence(t *testing.T) {
 	if changed.TrackInfo == nil || changed.TrackInfo.Id != "next" {
 		t.Fatalf("unexpected track-change message: %#v", &changed)
 	}
-	paused := requirePlaybackMessage(t, guest, ActionPause)
-	if paused.TrackId != "next" || paused.Position != 0 {
-		t.Fatalf("unexpected pause message: %#v", &paused)
+	if changed.Revision != 1 || changed.ServerTime == 0 {
+		t.Fatalf("track change timing metadata = revision %d, server time %d", changed.Revision, changed.ServerTime)
 	}
-	var complete pb.BufferCompletePayload
-	if msgType := receiveTestMessage(t, guest, &complete); msgType != MsgTypeBufferComplete || complete.TrackId != "next" {
-		t.Fatalf("unexpected buffer-complete message: type=%q payload=%#v", msgType, &complete)
+	select {
+	case message := <-guest.Send:
+		t.Fatalf("unexpected duplicate transition message: %x", message)
+	default:
 	}
-	seek := requirePlaybackMessage(t, guest, ActionSeek)
-	if seek.TrackId != "next" || seek.Position != 0 {
-		t.Fatalf("unexpected seek message: %#v", &seek)
+}
+
+func TestPlaybackSkipWaitsForCanonicalTrackChange(t *testing.T) {
+	server, host, guest, room := playbackTestRoom()
+	room.State.IsPlaying = true
+	room.State.Position = 500
+	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{Action: ActionSkipNext}))
+	if room.State.Position != 500 || room.State.Revision != 0 {
+		t.Fatalf("skip mutated authoritative state: %#v", room.State)
+	}
+	select {
+	case message := <-guest.Send:
+		t.Fatalf("skip was broadcast before canonical track change: %x", message)
+	default:
+	}
+}
+
+func TestPlaybackActionCompensatesTransitAndAdvancesRevision(t *testing.T) {
+	server, host, guest, room := playbackTestRoom()
+	room.State.Revision = 7
+	capturedAt := time.Now().Add(-200 * time.Millisecond).UnixMilli()
+	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{
+		Action: ActionPlay, TrackID: "current", Position: 100, CapturedAtServerTime: capturedAt,
+	}))
+
+	if room.State.Position < 250 || room.State.Position > 450 {
+		t.Fatalf("transit-compensated position = %d, want approximately 300", room.State.Position)
+	}
+	if room.State.Revision != 8 || room.State.LastUpdate == 0 {
+		t.Fatalf("state timing metadata = revision %d, update %d", room.State.Revision, room.State.LastUpdate)
+	}
+	play := requirePlaybackMessage(t, guest, ActionPlay)
+	if play.Revision != 8 || play.ServerTime != room.State.LastUpdate || play.Position != room.State.Position {
+		t.Fatalf("broadcast does not match authoritative state: %#v", play)
+	}
+}
+
+func TestPlaybackActionRejectsStaleTrack(t *testing.T) {
+	server, host, guest, room := playbackTestRoom()
+	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{
+		Action: ActionSeek, TrackID: "old", Position: 500,
+	}))
+	requireTestError(t, host, "stale_track")
+	if room.State.Position != 0 || room.State.Revision != 0 {
+		t.Fatalf("stale action mutated state: %#v", room.State)
+	}
+	select {
+	case message := <-guest.Send:
+		t.Fatalf("stale action was broadcast: %x", message)
+	default:
 	}
 }
 
@@ -163,18 +211,23 @@ func TestPlaybackActionQueueMutationsAndSyncSanitization(t *testing.T) {
 
 	syncQueue := []TrackInfo{
 		{ID: " valid ", Title: " Valid ", Duration: 0},
+		{ID: "valid", Title: "Duplicate", Duration: 10},
+		{ID: "current", Title: "Current track", Duration: 10},
 		{ID: "", Title: "Invalid", Duration: 10},
 	}
-	for i := len(syncQueue); i < MaxQueueSize+1; i++ {
-		syncQueue = append(syncQueue, TrackInfo{ID: "bulk", Title: "Bulk", Duration: 10})
+	for i := 0; i < MaxQueueSize; i++ {
+		syncQueue = append(syncQueue, TrackInfo{ID: fmt.Sprintf("bulk-%d", i), Title: "Bulk", Duration: 10})
 	}
 	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{Action: ActionSyncQueue, Queue: syncQueue}))
 	broadcast := requirePlaybackMessage(t, guest, ActionSyncQueue)
-	if len(room.State.Queue) != MaxQueueSize-1 || len(broadcast.Queue) != MaxQueueSize-1 {
-		t.Fatalf("sanitized queue lengths = state %d, broadcast %d, want %d", len(room.State.Queue), len(broadcast.Queue), MaxQueueSize-1)
+	if len(room.State.Queue) != MaxQueueSize || len(broadcast.Queue) != MaxQueueSize {
+		t.Fatalf("sanitized queue lengths = state %d, broadcast %d, want %d", len(room.State.Queue), len(broadcast.Queue), MaxQueueSize)
 	}
 	if room.State.Queue[0].ID != "valid" || room.State.Queue[0].Duration != 180000 {
 		t.Fatalf("first queue item was not sanitized: %#v", room.State.Queue[0])
+	}
+	if containsTrackID(room.State.Queue, "current") {
+		t.Fatal("sync queue retained the current track in the upcoming queue")
 	}
 
 	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{Action: ActionSyncQueue}))
@@ -268,27 +321,23 @@ func TestBufferReadyDisabledSendsPerClientSync(t *testing.T) {
 			room.State.Position = 250
 			room.State.LastUpdate = time.Now().Add(time.Hour).UnixMilli()
 
-			server.handleBufferReady(guest, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "stale"}))
+			server.handleBufferReady(guest, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "current"}))
 
-			var complete pb.BufferCompletePayload
-			if msgType := receiveTestMessage(t, guest, &complete); msgType != MsgTypeBufferComplete || complete.TrackId != "current" {
-				t.Fatalf("unexpected buffer completion: type=%q payload=%#v", msgType, &complete)
-			}
 			seek := requirePlaybackMessage(t, guest, ActionSeek)
 			if seek.TrackId != "current" || seek.Position != 250 {
 				t.Fatalf("unexpected seek: %#v", &seek)
 			}
+			stateAction := ActionPause
 			if tt.playing {
-				play := requirePlaybackMessage(t, guest, ActionPlay)
-				if play.Position != 250 {
-					t.Fatalf("play position = %d, want 250", play.Position)
-				}
-			} else {
-				select {
-				case message := <-guest.Send:
-					t.Fatalf("unexpected extra message: %x", message)
-				default:
-				}
+				stateAction = ActionPlay
+			}
+			state := requirePlaybackMessage(t, guest, stateAction)
+			if state.Position != 250 || state.ServerTime == 0 {
+				t.Fatalf("state position/time = %d/%d, want 250/nonzero", state.Position, state.ServerTime)
+			}
+			var complete pb.BufferCompletePayload
+			if msgType := receiveTestMessage(t, guest, &complete); msgType != MsgTypeBufferComplete || complete.TrackId != "current" {
+				t.Fatalf("unexpected buffer completion: type=%q payload=%#v", msgType, &complete)
 			}
 		})
 	}
@@ -316,21 +365,21 @@ func TestBufferReadyEnabledWaitsThenCompletes(t *testing.T) {
 		room.BufferingUsers = map[string]bool{"guest": true}
 		room.State.IsPlaying = true
 		room.State.Position = 600
-		server.handleBufferReady(guest, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "stale"}))
+		server.handleBufferReady(guest, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "current"}))
 
-		if room.State.Position != 0 || room.State.LastUpdate == 0 {
+		if room.State.Position != 600 || room.State.LastUpdate != 0 {
 			t.Fatalf("unexpected completed buffer state: %#v", room.State)
 		}
 		for _, client := range []*Client{host, guest} {
+			if seek := requirePlaybackMessage(t, client, ActionSeek); seek.TrackId != "current" || seek.Position != 600 {
+				t.Fatalf("unexpected seek: %#v", &seek)
+			}
+			if play := requirePlaybackMessage(t, client, ActionPlay); play.TrackId != "current" || play.Position != 600 {
+				t.Fatalf("unexpected play: %#v", &play)
+			}
 			var complete pb.BufferCompletePayload
 			if msgType := receiveTestMessage(t, client, &complete); msgType != MsgTypeBufferComplete || complete.TrackId != "current" {
 				t.Fatalf("unexpected completion: type=%q payload=%#v", msgType, &complete)
-			}
-			if seek := requirePlaybackMessage(t, client, ActionSeek); seek.TrackId != "current" || seek.Position != 0 {
-				t.Fatalf("unexpected seek: %#v", &seek)
-			}
-			if play := requirePlaybackMessage(t, client, ActionPlay); play.TrackId != "current" || play.Position != 0 {
-				t.Fatalf("unexpected play: %#v", &play)
 			}
 		}
 	})
@@ -346,6 +395,7 @@ func TestBufferReadyValidationErrors(t *testing.T) {
 		{name: "invalid payload", payload: []byte{0xff}, code: "invalid_payload"},
 		{name: "missing track", code: "missing_track_id"},
 		{name: "not in room", noRoom: true, code: "not_in_room"},
+		{name: "stale track", code: "stale_track"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -358,6 +408,8 @@ func TestBufferReadyValidationErrors(t *testing.T) {
 				trackID := ""
 				if tt.noRoom {
 					trackID = "track"
+				} else if tt.name == "stale track" {
+					trackID = "old"
 				}
 				payload = encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: trackID})
 			}
@@ -374,6 +426,7 @@ func TestRequestSyncReturnsSnapshotAndLivePosition(t *testing.T) {
 	room.State.LastUpdate = time.Now().Add(-time.Second).UnixMilli()
 	room.State.Volume = 0.8
 	room.State.Queue = []TrackInfo{{ID: "queued", Title: "Queued", Duration: 100}}
+	room.State.Revision = 9
 
 	server.handleRequestSync(guest)
 
@@ -384,7 +437,7 @@ func TestRequestSyncReturnsSnapshotAndLivePosition(t *testing.T) {
 	if sync.CurrentTrack == nil || sync.CurrentTrack.Id != "current" || !sync.IsPlaying || sync.Position != 1000 {
 		t.Fatalf("unexpected sync state: %#v", &sync)
 	}
-	if sync.LastUpdate == 0 || sync.Volume != float32(0.8) || len(sync.Queue) != 1 || sync.Queue[0].Id != "queued" {
+	if sync.LastUpdate == 0 || sync.Volume != float32(0.8) || len(sync.Queue) != 1 || sync.Queue[0].Id != "queued" || sync.Revision != 9 {
 		t.Fatalf("incomplete sync state: %#v", &sync)
 	}
 }
@@ -394,6 +447,65 @@ func TestRequestSyncRejectsClientOutsideRoom(t *testing.T) {
 	client := newClient("outside", nil)
 	server.handleRequestSync(client)
 	requireTestError(t, client, "not_in_room")
+}
+
+func TestConcurrentPlaybackAndSnapshotsAreDeliveredInRevisionOrder(t *testing.T) {
+	server, host, guest, room := playbackTestRoom()
+	const count = 20
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		payload := encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{
+			Action: ActionSetVolume, Volume: float64(i) / count,
+		})
+		wg.Add(2)
+		go func(payload []byte) {
+			defer wg.Done()
+			server.handlePlaybackAction(host, payload)
+		}(payload)
+		go func() {
+			defer wg.Done()
+			server.handleRequestSync(guest)
+		}()
+	}
+	wg.Wait()
+
+	codec := NewMessageCodec(true)
+	var lastRevision uint64
+	for i := 0; i < count*2; i++ {
+		select {
+		case data := <-guest.Send:
+			msgType, payload, err := codec.Decode(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var revision uint64
+			switch msgType {
+			case MsgTypeSyncPlayback:
+				var action pb.PlaybackActionPayload
+				if err := proto.Unmarshal(payload, &action); err != nil {
+					t.Fatal(err)
+				}
+				revision = action.Revision
+			case MsgTypeSyncState:
+				var state pb.SyncStatePayload
+				if err := proto.Unmarshal(payload, &state); err != nil {
+					t.Fatal(err)
+				}
+				revision = state.Revision
+			default:
+				t.Fatalf("unexpected message type %q", msgType)
+			}
+			if revision < lastRevision {
+				t.Fatalf("revision moved backwards: %d after %d", revision, lastRevision)
+			}
+			lastRevision = revision
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for concurrent messages")
+		}
+	}
+	if room.State.Revision != count {
+		t.Fatalf("final revision = %d, want %d", room.State.Revision, count)
+	}
 }
 
 func TestServerIdentifierAndTokenGeneration(t *testing.T) {
@@ -434,6 +546,22 @@ func TestHandleMessagePingUnknownInvalidAndDispatch(t *testing.T) {
 		server.handleMessage(host, message)
 		if msgType := receiveTestMessage(t, host, nil); msgType != MsgTypePong {
 			t.Fatalf("message type = %q, want %q", msgType, MsgTypePong)
+		}
+	})
+
+	t.Run("timestamped ping", func(t *testing.T) {
+		before := time.Now().UnixMilli()
+		message, err := codec.Encode(MsgTypePing, PingPayload{ClientTime: 1234, Sequence: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.handleMessage(host, message)
+		var pong pb.PongPayload
+		if msgType := receiveTestMessage(t, host, &pong); msgType != MsgTypePong {
+			t.Fatalf("message type = %q, want %q", msgType, MsgTypePong)
+		}
+		if pong.ClientTime != 1234 || pong.Sequence != 7 || pong.ServerReceiveTime < before || pong.ServerSendTime < pong.ServerReceiveTime {
+			t.Fatalf("invalid pong timing sample: %#v", &pong)
 		}
 	})
 

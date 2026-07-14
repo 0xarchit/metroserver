@@ -33,6 +33,7 @@ type Room struct {
 	HostStartPosition  int64           // Host's position when buffering started
 	HostDisconnectedAt *time.Time      // When the host disconnected (nil if connected)
 	EmptySince         *time.Time      // When the room became empty (nil if not empty)
+	syncMu             sync.Mutex      // Serializes playback snapshots and their delivery.
 	mu                 sync.RWMutex
 }
 
@@ -227,7 +228,7 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 	case MsgTypeTransferHost:
 		s.handleTransferHost(c, payloadBytes)
 	case MsgTypePing:
-		c.sendMessage(s.logger, MsgTypePong, nil)
+		s.handlePing(c, payloadBytes)
 	case MsgTypeRequestSync:
 		s.handleRequestSync(c)
 	case MsgTypeReconnect:
@@ -243,6 +244,24 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 	default:
 		c.sendError(s.logger, "unknown_message_type", fmt.Sprintf("Unknown message type: %s", msgType))
 	}
+}
+
+func (s *Server) handlePing(c *Client, payload []byte) {
+	receivedAt := time.Now().UnixMilli()
+	p := PingPayload{}
+	if len(payload) > 0 {
+		if err := decodePayload(payload, MsgTypePing, &p); err != nil {
+			c.sendError(s.logger, "invalid_payload", "Invalid ping payload")
+			return
+		}
+	}
+
+	c.sendMessage(s.logger, MsgTypePong, PongPayload{
+		ClientTime:        p.ClientTime,
+		ServerReceiveTime: receivedAt,
+		ServerSendTime:    time.Now().UnixMilli(),
+		Sequence:          p.Sequence,
+	})
 }
 
 func (s *Server) handleClientCapabilities(c *Client, payload []byte) {

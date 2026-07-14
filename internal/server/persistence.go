@@ -260,6 +260,11 @@ func (s *Server) LoadState() error {
 			disconnectedUsers = make(map[string]*Session)
 		}
 		if persistentRoom.State != nil {
+			currentTrackID := ""
+			if persistentRoom.State.CurrentTrack != nil {
+				currentTrackID = persistentRoom.State.CurrentTrack.ID
+			}
+			persistentRoom.State.Queue = sanitizeUpcomingQueue(persistentRoom.State.Queue, currentTrackID)
 			for i := range persistentRoom.State.Users {
 				persistentRoom.State.Users[i].IsConnected = false
 			}

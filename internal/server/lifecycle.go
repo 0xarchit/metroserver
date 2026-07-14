@@ -340,6 +340,7 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		return
 	}
 
+	room.syncMu.Lock()
 	room.mu.Lock()
 
 	// Restore the client
@@ -374,9 +375,7 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 
 	// Calculate live position for reconnect state
 	nowMs := time.Now().UnixMilli()
-	liveState := cloneRoomState(room.State)
-	liveState.Position = livePlaybackPosition(room.State, nowMs)
-	liveState.LastUpdate = nowMs
+	liveState := cloneLiveRoomState(room.State, nowMs)
 
 	isHost := room.Host == c
 	pendingJoinRequests := make([]JoinRequestPayload, 0, len(room.PendingJoins))
@@ -425,6 +424,7 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		State:    liveState,
 		IsHost:   isHost,
 	})
+	room.syncMu.Unlock()
 
 	if isHost {
 		for _, joinRequest := range pendingJoinRequests {

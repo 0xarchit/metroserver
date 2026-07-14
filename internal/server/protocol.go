@@ -120,15 +120,29 @@ type UserLeftPayload struct {
 
 // PlaybackActionPayload is for playback control actions
 type PlaybackActionPayload struct {
-	Action     string      `json:"action"`
-	TrackID    string      `json:"track_id,omitempty"`
-	Position   int64       `json:"position,omitempty"` // milliseconds
-	TrackInfo  *TrackInfo  `json:"track_info,omitempty"`
-	InsertNext bool        `json:"insert_next,omitempty"`
-	Queue      []TrackInfo `json:"queue,omitempty"`
-	QueueTitle string      `json:"queue_title,omitempty"`
-	Volume     float64     `json:"volume"`
-	ServerTime int64       `json:"server_time,omitempty"`
+	Action               string      `json:"action"`
+	TrackID              string      `json:"track_id,omitempty"`
+	Position             int64       `json:"position,omitempty"` // milliseconds
+	TrackInfo            *TrackInfo  `json:"track_info,omitempty"`
+	InsertNext           bool        `json:"insert_next,omitempty"`
+	Queue                []TrackInfo `json:"queue,omitempty"`
+	QueueTitle           string      `json:"queue_title,omitempty"`
+	Volume               float64     `json:"volume"`
+	ServerTime           int64       `json:"server_time,omitempty"`
+	Revision             uint64      `json:"revision,omitempty"`
+	CapturedAtServerTime int64       `json:"captured_at_server_time,omitempty"`
+}
+
+type PingPayload struct {
+	ClientTime int64  `json:"client_time"`
+	Sequence   uint64 `json:"sequence"`
+}
+
+type PongPayload struct {
+	ClientTime        int64  `json:"client_time"`
+	ServerReceiveTime int64  `json:"server_receive_time"`
+	ServerSendTime    int64  `json:"server_send_time"`
+	Sequence          uint64 `json:"sequence"`
 }
 
 // Suggestion payloads
@@ -206,6 +220,7 @@ type RoomState struct {
 	LastUpdate   int64       `json:"last_update"` // unix timestamp ms
 	Volume       float64     `json:"volume"`
 	Queue        []TrackInfo `json:"queue,omitempty"`
+	Revision     uint64      `json:"revision,omitempty"`
 }
 
 // UserInfo contains information about a user
@@ -246,6 +261,7 @@ type SyncStatePayload struct {
 	LastUpdate   int64       `json:"last_update"` // unix timestamp ms
 	Volume       float64     `json:"volume"`
 	Queue        []TrackInfo `json:"queue,omitempty"`
+	Revision     uint64      `json:"revision,omitempty"`
 }
 
 // ReconnectPayload is for reconnecting to a room

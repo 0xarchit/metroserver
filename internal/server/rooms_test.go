@@ -244,15 +244,13 @@ func TestJoinApproveAndRejectFlows(t *testing.T) {
 		if got := receiveTestMessage(t, existing, &approved); got != MsgTypeJoinApproved || approved.RoomCode != room.Code || approved.State.GetHostId() != "host" {
 			t.Fatalf("unexpected join approval: type=%q payload=%#v", got, &approved)
 		}
-		var buffered pb.BufferCompletePayload
-		if got := receiveTestMessage(t, existing, &buffered); got != MsgTypeBufferComplete || buffered.TrackId != "playing" {
-			t.Fatalf("unexpected buffer message: type=%q payload=%#v", got, &buffered)
+		if approved.State.LastUpdate == 0 || approved.State.Position < 500 {
+			t.Fatalf("join approval did not contain a live snapshot: %#v", approved.State)
 		}
-		for _, action := range []string{ActionSeek, ActionPlay} {
-			var sync pb.PlaybackActionPayload
-			if got := receiveTestMessage(t, existing, &sync); got != MsgTypeSyncPlayback || sync.Action != action || sync.TrackId != "playing" {
-				t.Fatalf("unexpected playback sync: type=%q payload=%#v", got, &sync)
-			}
+		select {
+		case message := <-existing.Send:
+			t.Fatalf("join approval included premature playback messages: %x", message)
+		default:
 		}
 		var joined pb.UserJoinedPayload
 		if got := receiveTestMessage(t, host, &joined); got != MsgTypeUserJoined || joined.UserId != "guest" {
