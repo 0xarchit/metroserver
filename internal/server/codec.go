@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -161,13 +161,15 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		return &pb.RejectJoinPayload{UserId: p.UserID, Reason: p.Reason}, nil
 	case *PlaybackActionPayload:
 		pbPayload := &pb.PlaybackActionPayload{
-			Action:     p.Action,
-			TrackId:    p.TrackID,
-			Position:   p.Position,
-			InsertNext: p.InsertNext,
-			QueueTitle: p.QueueTitle,
-			Volume:     float32(p.Volume),
-			ServerTime: p.ServerTime,
+			Action:               p.Action,
+			TrackId:              p.TrackID,
+			Position:             p.Position,
+			InsertNext:           p.InsertNext,
+			QueueTitle:           p.QueueTitle,
+			Volume:               float32(p.Volume),
+			ServerTime:           p.ServerTime,
+			Revision:             p.Revision,
+			CapturedAtServerTime: p.CapturedAtServerTime,
 		}
 		if p.TrackInfo != nil {
 			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
@@ -181,6 +183,10 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		return pbPayload, nil
 	case *BufferReadyPayload:
 		return &pb.BufferReadyPayload{TrackId: p.TrackID}, nil
+	case *PingPayload:
+		return &pb.PingPayload{ClientTime: p.ClientTime, Sequence: p.Sequence}, nil
+	case *PongPayload:
+		return &pb.PongPayload{ClientTime: p.ClientTime, ServerReceiveTime: p.ServerReceiveTime, ServerSendTime: p.ServerSendTime, Sequence: p.Sequence}, nil
 	case *KickUserPayload:
 		return &pb.KickUserPayload{UserId: p.UserID, Reason: p.Reason}, nil
 	case *TransferHostPayload:
@@ -241,6 +247,7 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 			Position:   p.Position,
 			LastUpdate: p.LastUpdate,
 			Volume:     float32(p.Volume),
+			Revision:   p.Revision,
 		}
 		if p.CurrentTrack != nil {
 			pbPayload.CurrentTrack = trackInfoToProto(p.CurrentTrack)
@@ -326,6 +333,7 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 			Position:   p.Position,
 			LastUpdate: p.LastUpdate,
 			Volume:     float32(p.Volume),
+			Revision:   p.Revision,
 		}
 		if p.CurrentTrack != nil {
 			pbPayload.CurrentTrack = trackInfoToProto(p.CurrentTrack)
@@ -371,13 +379,15 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		return &pb.SuggestionRejectedPayload{SuggestionId: p.SuggestionID, Reason: p.Reason}, nil
 	case PlaybackActionPayload:
 		pbPayload := &pb.PlaybackActionPayload{
-			Action:     p.Action,
-			TrackId:    p.TrackID,
-			Position:   p.Position,
-			InsertNext: p.InsertNext,
-			QueueTitle: p.QueueTitle,
-			Volume:     float32(p.Volume),
-			ServerTime: p.ServerTime,
+			Action:               p.Action,
+			TrackId:              p.TrackID,
+			Position:             p.Position,
+			InsertNext:           p.InsertNext,
+			QueueTitle:           p.QueueTitle,
+			Volume:               float32(p.Volume),
+			ServerTime:           p.ServerTime,
+			Revision:             p.Revision,
+			CapturedAtServerTime: p.CapturedAtServerTime,
 		}
 		if p.TrackInfo != nil {
 			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
@@ -389,6 +399,10 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 			}
 		}
 		return pbPayload, nil
+	case PingPayload:
+		return &pb.PingPayload{ClientTime: p.ClientTime, Sequence: p.Sequence}, nil
+	case PongPayload:
+		return &pb.PongPayload{ClientTime: p.ClientTime, ServerReceiveTime: p.ServerReceiveTime, ServerSendTime: p.ServerSendTime, Sequence: p.Sequence}, nil
 	case ServerCapabilitiesPayload:
 		return &pb.ServerCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ServerVersion: p.ServerVersion}, nil
 
@@ -430,13 +444,15 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 			return nil, err
 		}
 		payload := &PlaybackActionPayload{
-			Action:     pbMsg.Action,
-			TrackID:    pbMsg.TrackId,
-			Position:   pbMsg.Position,
-			InsertNext: pbMsg.InsertNext,
-			QueueTitle: pbMsg.QueueTitle,
-			Volume:     float64(pbMsg.Volume),
-			ServerTime: pbMsg.ServerTime,
+			Action:               pbMsg.Action,
+			TrackID:              pbMsg.TrackId,
+			Position:             pbMsg.Position,
+			InsertNext:           pbMsg.InsertNext,
+			QueueTitle:           pbMsg.QueueTitle,
+			Volume:               float64(pbMsg.Volume),
+			ServerTime:           pbMsg.ServerTime,
+			Revision:             pbMsg.Revision,
+			CapturedAtServerTime: pbMsg.CapturedAtServerTime,
 		}
 		if pbMsg.TrackInfo != nil {
 			payload.TrackInfo = protoToTrackInfo(pbMsg.TrackInfo)
@@ -454,6 +470,12 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 			return nil, err
 		}
 		return &BufferReadyPayload{TrackID: pb.TrackId}, nil
+	case MsgTypePing:
+		var pbPayload pb.PingPayload
+		if err := proto.Unmarshal(data, &pbPayload); err != nil {
+			return nil, err
+		}
+		return &PingPayload{ClientTime: pbPayload.ClientTime, Sequence: pbPayload.Sequence}, nil
 	case MsgTypeKickUser:
 		var pb pb.KickUserPayload
 		if err := proto.Unmarshal(data, &pb); err != nil {
@@ -548,6 +570,7 @@ func roomStateToProto(r *RoomState) *pb.RoomState {
 		Position:   r.Position,
 		LastUpdate: r.LastUpdate,
 		Volume:     float32(r.Volume),
+		Revision:   r.Revision,
 	}
 
 	if r.CurrentTrack != nil {
@@ -615,6 +638,12 @@ func decodePayload(payloadBytes []byte, msgType string, target interface{}) erro
 		p, ok := payload.(*BufferReadyPayload)
 		if !ok {
 			return fmt.Errorf("payload type mismatch: expected BufferReadyPayload, got %T", payload)
+		}
+		*t = *p
+	case *PingPayload:
+		p, ok := payload.(*PingPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected PingPayload, got %T", payload)
 		}
 		*t = *p
 	case *KickUserPayload:
