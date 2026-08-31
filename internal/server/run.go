@@ -36,18 +36,6 @@ func Run() {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("/uas", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		server.mu.RLock()
-		uas := make(map[string]int, len(server.userAgents))
-		for k, v := range server.userAgents {
-			uas[k] = v
-		}
-		server.mu.RUnlock()
-		json.NewEncoder(w).Encode(uas)
-	})
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

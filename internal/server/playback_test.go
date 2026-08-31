@@ -2,11 +2,13 @@ package server
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -267,6 +269,8 @@ func TestPlaybackActionValidationErrors(t *testing.T) {
 		{name: "queue remove missing ID", code: "missing_track_id"},
 		{name: "volume below range", code: "invalid_volume"},
 		{name: "volume above range", code: "invalid_volume"},
+		{name: "volume NaN", code: "invalid_volume"},
+		{name: "volume infinity", code: "invalid_volume"},
 		{name: "unknown action", code: "unknown_action"},
 	}
 
@@ -286,6 +290,8 @@ func TestPlaybackActionValidationErrors(t *testing.T) {
 		"queue remove missing ID":   {Action: ActionQueueRemove},
 		"volume below range":        {Action: ActionSetVolume, Volume: -0.1},
 		"volume above range":        {Action: ActionSetVolume, Volume: 1.1},
+		"volume NaN":                {Action: ActionSetVolume, Volume: math.NaN()},
+		"volume infinity":           {Action: ActionSetVolume, Volume: math.Inf(1)},
 		"unknown action":            {Action: "rewind"},
 	}
 
@@ -442,11 +448,32 @@ func TestRequestSyncReturnsSnapshotAndLivePosition(t *testing.T) {
 	}
 }
 
+func TestRequestSyncDropsRepeatedRequests(t *testing.T) {
+	server, _, guest, _ := playbackTestRoom()
+	server.handleRequestSync(guest)
+	receiveTestMessage(t, guest, nil)
+
+	server.handleRequestSync(guest)
+	if got := len(guest.Send); got != 0 {
+		t.Fatalf("repeated sync queued %d responses, want 0", got)
+	}
+}
+
 func TestRequestSyncRejectsClientOutsideRoom(t *testing.T) {
 	server := testServer()
 	client := newClient("outside", nil)
 	server.handleRequestSync(client)
 	requireTestError(t, client, "not_in_room")
+}
+
+func TestRequestSyncRejectsStaleRoomReference(t *testing.T) {
+	server, _, guest, room := playbackTestRoom()
+	replacement := newClient(guest.clientID(), nil)
+	room.Clients[guest.clientID()] = replacement
+
+	server.handleRequestSync(guest)
+
+	requireTestError(t, guest, "not_in_room")
 }
 
 func TestConcurrentPlaybackAndSnapshotsAreDeliveredInRevisionOrder(t *testing.T) {
@@ -471,7 +498,7 @@ func TestConcurrentPlaybackAndSnapshotsAreDeliveredInRevisionOrder(t *testing.T)
 
 	codec := NewMessageCodec(true)
 	var lastRevision uint64
-	for i := 0; i < count*2; i++ {
+	for i := 0; i < count+1; i++ {
 		select {
 		case data := <-guest.Send:
 			msgType, payload, err := codec.Decode(data)
@@ -505,6 +532,33 @@ func TestConcurrentPlaybackAndSnapshotsAreDeliveredInRevisionOrder(t *testing.T)
 	}
 	if room.State.Revision != count {
 		t.Fatalf("final revision = %d, want %d", room.State.Revision, count)
+	}
+}
+
+func TestPlaybackActionAuthorizesBeforeDecodingQueue(t *testing.T) {
+	server, _, guest, _ := playbackTestRoom()
+	outside := newClient("outside", nil)
+
+	server.handlePlaybackAction(outside, []byte{0xff})
+	requireTestError(t, outside, "not_in_room")
+
+	server.handlePlaybackAction(guest, []byte{0xff})
+	requireTestError(t, guest, "not_host")
+}
+
+func TestPlaybackActionSanitizesQueueTitle(t *testing.T) {
+	server, host, guest, _ := playbackTestRoom()
+	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{
+		Action:     ActionQueueClear,
+		QueueTitle: strings.Repeat("x", MaxTrackTitleLength+50) + "\x01",
+	}))
+
+	var action pb.PlaybackActionPayload
+	if msgType := receiveTestMessage(t, guest, &action); msgType != MsgTypeSyncPlayback {
+		t.Fatalf("message type = %q, want %q", msgType, MsgTypeSyncPlayback)
+	}
+	if action.QueueTitle != strings.Repeat("x", MaxTrackTitleLength) {
+		t.Fatalf("queue title length = %d, want %d sanitized bytes", len(action.QueueTitle), MaxTrackTitleLength)
 	}
 }
 
@@ -617,12 +671,53 @@ func TestClientCapabilitiesResponses(t *testing.T) {
 		}
 	})
 
+	t.Run("client can disable compression", func(t *testing.T) {
+		server := testServer()
+		client := newClient("client", nil)
+		payload := encodeTestPayload(t, MsgTypeClientCapabilities, &ClientCapabilitiesPayload{SupportsProtobuf: true})
+		server.handleClientCapabilities(client, payload)
+		receiveTestMessage(t, client, nil)
+
+		encoded, err := client.codec.Encode(MsgTypeJoinRejected, JoinRejectedPayload{Reason: strings.Repeat("x", 1000)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope pb.Envelope
+		if err := proto.Unmarshal(encoded, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Compressed {
+			t.Fatal("server compressed a message after the client declined compression")
+		}
+	})
+
 	t.Run("protobuf required", func(t *testing.T) {
 		server := testServer()
 		client := newClient("client", nil)
 		payload := encodeTestPayload(t, MsgTypeClientCapabilities, &ClientCapabilitiesPayload{})
 		server.handleClientCapabilities(client, payload)
 		requireTestError(t, client, "unsupported_client")
+	})
+
+	t.Run("capabilities cannot be renegotiated", func(t *testing.T) {
+		server := testServer()
+		client := newClient("client", nil)
+		payload := encodeTestPayload(t, MsgTypeClientCapabilities, &ClientCapabilitiesPayload{SupportsProtobuf: true, SupportsCompression: true})
+		server.handleClientCapabilities(client, payload)
+		receiveTestMessage(t, client, nil)
+		server.handleClientCapabilities(client, payload)
+		requireTestError(t, client, "capabilities_already_set")
+	})
+
+	t.Run("capabilities must precede room membership", func(t *testing.T) {
+		server := testServer()
+		client := newClient("client", nil)
+		room := &Room{}
+		client.setRoom(room)
+		client.clearRoom(room)
+		payload := encodeTestPayload(t, MsgTypeClientCapabilities, &ClientCapabilitiesPayload{SupportsProtobuf: true})
+		server.handleClientCapabilities(client, payload)
+		requireTestError(t, client, "capabilities_too_late")
 	})
 
 	t.Run("invalid payload", func(t *testing.T) {

@@ -11,3 +11,7 @@ LICENSE
 .vscode
 .idea
 *.iml
+/.cortexkit
+**/server_state.json
+/coverage.out
+/cmd/metroserver/metroserver

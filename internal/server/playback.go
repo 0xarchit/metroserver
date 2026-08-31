@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"go.uber.org/zap"
@@ -97,6 +98,19 @@ func containsTrackID(queue []TrackInfo, trackID string) bool {
 }
 
 func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
+	room := c.currentRoom()
+	if room == nil {
+		c.sendError(s.logger, "not_in_room", "You are not in a room")
+		return
+	}
+	room.mu.RLock()
+	isHost := room.Host == c && room.HostDisconnectedAt == nil && room.Clients[c.clientID()] == c
+	room.mu.RUnlock()
+	if !isHost {
+		c.sendError(s.logger, "not_host", "Only the host can control playback")
+		return
+	}
+
 	var p PlaybackActionPayload
 	if err := decodePayload(payload, MsgTypePlaybackAction, &p); err != nil {
 		c.sendError(s.logger, "invalid_payload", "Invalid playback action payload")
@@ -106,18 +120,13 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		c.sendError(s.logger, "missing_action", "Action is required")
 		return
 	}
-
-	room := c.currentRoom()
-	if room == nil {
-		c.sendError(s.logger, "not_in_room", "You are not in a room")
-		return
-	}
+	p.QueueTitle = sanitizeString(p.QueueTitle, MaxTrackTitleLength)
 
 	room.syncMu.Lock()
 	defer room.syncMu.Unlock()
 	room.mu.Lock()
 
-	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
+	if room.Host != c || room.HostDisconnectedAt != nil || room.Clients[c.clientID()] != c {
 		room.mu.Unlock()
 		c.sendError(s.logger, "not_host", "Only the host can control playback")
 		return
@@ -263,7 +272,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		room.State.Queue = append([]TrackInfo(nil), p.Queue...)
 
 	case ActionSetVolume:
-		if p.Volume < 0 || p.Volume > 1 {
+		if math.IsNaN(p.Volume) || math.IsInf(p.Volume, 0) || p.Volume < 0 || p.Volume > 1 {
 			room.mu.Unlock()
 			c.sendError(s.logger, "invalid_volume", "Volume must be between 0 and 1")
 			return
@@ -376,7 +385,17 @@ func (s *Server) handleRequestSync(c *Client) {
 	room.syncMu.Lock()
 	defer room.syncMu.Unlock()
 	room.mu.RLock()
-	nowMs := time.Now().UnixMilli()
+	if room.Clients[c.clientID()] != c {
+		room.mu.RUnlock()
+		c.sendError(s.logger, "not_in_room", "You are not an active room member")
+		return
+	}
+	now := time.Now()
+	if !c.allowSyncResponse(now) {
+		room.mu.RUnlock()
+		return
+	}
+	nowMs := now.UnixMilli()
 	position := livePlaybackPosition(room.State, nowMs)
 	response := SyncStatePayload{
 		CurrentTrack: cloneTrackInfo(room.State.CurrentTrack),

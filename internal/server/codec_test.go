@@ -277,6 +277,18 @@ func TestFromProtoMessageVariants(t *testing.T) {
 	}
 }
 
+func TestFromProtoMessageRejectsExcessiveQueueCardinality(t *testing.T) {
+	queue := make([]*pb.TrackInfo, MaxQueueSize*2+1)
+	for i := range queue {
+		queue[i] = &pb.TrackInfo{}
+	}
+	payload := marshalCodecProto(t, &pb.PlaybackActionPayload{Action: ActionSyncQueue, Queue: queue})
+
+	if _, err := fromProtoMessage(MsgTypePlaybackAction, payload); err == nil {
+		t.Fatal("fromProtoMessage accepted an excessive number of queue entries")
+	}
+}
+
 func TestCodecConversionHelpers(t *testing.T) {
 	track := &TrackInfo{ID: "id", Title: "title", Artist: "artist", Album: "album", Duration: 99, Thumbnail: "thumb", SuggestedBy: "user"}
 	wantTrack := &pb.TrackInfo{Id: "id", Title: "title", Artist: "artist", Album: "album", Duration: 99, Thumbnail: "thumb", SuggestedBy: "user"}
@@ -397,4 +409,37 @@ func TestDecodePayloadMismatchedTargets(t *testing.T) {
 			}
 		})
 	}
+}
+
+func FuzzMessageCodecDecode(f *testing.F) {
+	valid, err := NewMessageCodec(true).Encode(MsgTypePing, PingPayload{ClientTime: 123, Sequence: 7})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add([]byte{})
+	f.Add([]byte{0xff})
+	f.Add(valid)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		NewMessageCodec(true).Decode(data)
+	})
+}
+
+func FuzzPlaybackActionPayloadDecode(f *testing.F) {
+	valid, err := proto.Marshal(&pb.PlaybackActionPayload{
+		Action: ActionChangeTrack,
+		TrackInfo: &pb.TrackInfo{
+			Id: "track", Title: "Track", Duration: 1000,
+		},
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add([]byte{})
+	f.Add([]byte{0xff})
+	f.Add(valid)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		fromProtoMessage(MsgTypePlaybackAction, data)
+	})
 }

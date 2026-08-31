@@ -22,6 +22,10 @@ func (s *Server) cleanupExpiredSessionsOnce(now time.Time) {
 	s.mu.Lock()
 	expired := make([]*Session, 0)
 	for token, session := range s.sessions {
+		if session == nil {
+			delete(s.sessions, token)
+			continue
+		}
 		if now.Sub(session.DisconnectAt) > ReconnectGracePeriod {
 			expired = append(expired, session)
 			delete(s.sessions, token)
@@ -96,14 +100,10 @@ func (s *Server) cleanupExpiredSessionsOnce(now time.Time) {
 
 		// If the room is now empty and past the retention window, delete it.
 		if shouldDeleteRoom {
-			s.mu.Lock()
-			// Re-check to avoid races where the room might have been recreated.
-			if currentRoom, exists := s.rooms[roomCode]; exists && currentRoom == room {
-				delete(s.rooms, roomCode)
+			if s.deleteRoomIfEmpty(room) {
 				s.logger.Info("Deleted empty room",
 					zap.String("room_code", roomCode))
 			}
-			s.mu.Unlock()
 			continue
 		}
 
@@ -131,8 +131,14 @@ func (s *Server) cleanupEmptyRooms() {
 		now := time.Now()
 		minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
 
-		s.mu.Lock()
+		s.mu.RLock()
+		rooms := make(map[string]*Room, len(s.rooms))
 		for roomCode, room := range s.rooms {
+			rooms[roomCode] = room
+		}
+		s.mu.RUnlock()
+
+		for roomCode, room := range rooms {
 			if room == nil {
 				continue
 			}
@@ -159,13 +165,13 @@ func (s *Server) cleanupEmptyRooms() {
 
 			// Check if room has been empty long enough and past retention window
 			if now.Sub(*emptySince) > EmptyRoomCleanupTimeout && now.After(minRetentionTime) {
-				delete(s.rooms, roomCode)
-				s.logger.Info("Deleted empty room after inactivity",
-					zap.String("room_code", roomCode),
-					zap.Duration("empty_for", now.Sub(*emptySince)))
+				if s.deleteRoomIfEmpty(room) {
+					s.logger.Info("Deleted empty room after inactivity",
+						zap.String("room_code", roomCode),
+						zap.Duration("empty_for", now.Sub(*emptySince)))
+				}
 			}
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -173,14 +179,16 @@ func (s *Server) removeClient(c *Client) {
 	s.mu.Lock()
 	delete(s.clients, c)
 	s.mu.Unlock()
+	c.closeSend()
 
 	if c.currentRoom() != nil {
 		s.handleClientDisconnect(c)
 	} else {
 		s.removePendingJoin(c)
+		if c.currentRoom() != nil {
+			s.handleClientDisconnect(c)
+		}
 	}
-
-	c.closeSend()
 
 	s.logger.Info("Client disconnected", zap.String("client_id", c.clientID()))
 }
@@ -202,6 +210,7 @@ func (s *Server) removePendingJoin(c *Client) {
 		room.mu.Lock()
 		if pending, exists := room.PendingJoins[clientID]; exists && pending == c {
 			delete(room.PendingJoins, clientID)
+			c.clearPendingRoom(room)
 		}
 		room.mu.Unlock()
 	}
@@ -222,7 +231,14 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		c.setSessionToken(sessionToken)
 	}
 
+	s.mu.Lock()
 	room.mu.Lock()
+	if room.Clients[clientID] != c {
+		room.mu.Unlock()
+		s.mu.Unlock()
+		c.clearRoom(room)
+		return
+	}
 
 	wasHost := room.Host == c
 
@@ -260,7 +276,7 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		room.HostDisconnectedAt = &now
 	}
 
-	c.setRoom(nil)
+	c.clearRoom(room)
 
 	// Collect clients to notify before unlocking
 	clientsToNotify := make([]*Client, 0, len(room.Clients))
@@ -271,11 +287,8 @@ func (s *Server) handleClientDisconnect(c *Client) {
 	}
 
 	room.EmptySince = nil
-	room.mu.Unlock()
-
-	// Store the session without holding the room lock to keep lock ordering consistent.
-	s.mu.Lock()
 	s.sessions[sessionToken] = session
+	room.mu.Unlock()
 	s.mu.Unlock()
 
 	// Notify other users about the temporary disconnect
@@ -309,10 +322,19 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		c.sendError(s.logger, "already_in_room", "Leave the current room before reconnecting")
 		return
 	}
+	if c.currentPendingRoom() != nil {
+		c.sendError(s.logger, "already_pending", "Cancel the pending join request before reconnecting")
+		return
+	}
 
-	s.mu.RLock()
+	now := time.Now()
+	s.mu.Lock()
 	session, exists := s.sessions[p.SessionToken]
-	s.mu.RUnlock()
+	expired := exists && (session == nil || now.Sub(session.DisconnectAt) > ReconnectGracePeriod)
+	if exists {
+		delete(s.sessions, p.SessionToken)
+	}
+	s.mu.Unlock()
 
 	if !exists {
 		c.sendError(s.logger, "session_not_found", "Session not found or expired")
@@ -320,10 +342,7 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	}
 
 	// Check if session is expired
-	if time.Since(session.DisconnectAt) > ReconnectGracePeriod {
-		s.mu.Lock()
-		delete(s.sessions, p.SessionToken)
-		s.mu.Unlock()
+	if expired {
 		c.sendError(s.logger, "session_expired", "Session has expired")
 		return
 	}
@@ -342,12 +361,24 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 
 	room.syncMu.Lock()
 	room.mu.Lock()
+	disconnectedSession, disconnected := room.DisconnectedUsers[session.UserID]
+	if !disconnected || disconnectedSession == nil || room.Clients[session.UserID] != nil {
+		room.mu.Unlock()
+		room.syncMu.Unlock()
+		c.sendError(s.logger, "session_not_found", "Session is no longer reconnectable")
+		return
+	}
+	if !c.trySetRoom(room) {
+		room.mu.Unlock()
+		room.syncMu.Unlock()
+		c.sendError(s.logger, "already_in_room", "Leave the current room before reconnecting")
+		return
+	}
 
 	// Restore the client
 	c.setClientID(session.UserID)
 	c.setUsername(session.Username)
 	c.setSessionToken(p.SessionToken)
-	c.setRoom(room)
 
 	// Add back to room clients
 	room.Clients[session.UserID] = c
@@ -363,9 +394,10 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	}
 
 	// Restore host status if they were the host
-	if session.IsHost {
+	if session.IsHost || (room.Host == nil && room.State.HostID == "") {
 		room.Host = c
 		room.HostDisconnectedAt = nil
+		room.State.HostID = session.UserID
 
 		// Update IsHost flag in users list
 		for i := range room.State.Users {
@@ -412,11 +444,6 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 
 	room.mu.Unlock()
 
-	// Remove session since reconnection succeeded
-	s.mu.Lock()
-	delete(s.sessions, p.SessionToken)
-	s.mu.Unlock()
-
 	// Send reconnected message to the client with LIVE state
 	c.sendMessage(s.logger, MsgTypeReconnected, ReconnectedPayload{
 		RoomCode: room.Code,
@@ -459,19 +486,33 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 
 func (s *Server) deleteRoomIfEmpty(room *Room) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	currentRoom, exists := s.rooms[room.Code]
 	if !exists || currentRoom != room {
+		s.mu.Unlock()
 		return false
 	}
 
 	room.mu.Lock()
-	defer room.mu.Unlock()
 	if len(room.Clients) != 0 || len(room.DisconnectedUsers) != 0 {
+		room.mu.Unlock()
+		s.mu.Unlock()
 		return false
 	}
 
+	pendingClients := make([]*Client, 0, len(room.PendingJoins))
+	for _, client := range room.PendingJoins {
+		if client != nil {
+			client.clearPendingRoom(room)
+			pendingClients = append(pendingClients, client)
+		}
+	}
+	room.PendingJoins = make(map[string]*Client)
 	delete(s.rooms, room.Code)
+	room.mu.Unlock()
+	s.mu.Unlock()
+
+	for _, client := range pendingClients {
+		client.sendMessage(s.logger, MsgTypeJoinRejected, JoinRejectedPayload{Reason: "Room is no longer available"})
+	}
 	return true
 }

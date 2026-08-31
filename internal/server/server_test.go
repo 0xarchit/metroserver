@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -173,6 +174,52 @@ func TestSaveStateIncludesActiveSessionsAndLoadHasNoPlaceholderHost(t *testing.T
 	}
 	if restoredRoom.HostDisconnectedAt == nil || time.Since(*restoredRoom.HostDisconnectedAt) > time.Minute {
 		t.Fatal("host disconnected timestamp was not restored")
+	}
+	if _, err := os.Stat(StateFile); !os.IsNotExist(err) {
+		t.Fatalf("consumed state file still exists: %v", err)
+	}
+
+	replayed := testServer()
+	if err := replayed.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed.rooms) != 0 || len(replayed.sessions) != 0 {
+		t.Fatal("consumed state was replayed")
+	}
+}
+
+func TestLoadStateIgnoresNilDisconnectedSessions(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+
+	state := PersistentState{
+		ServerShutdownTime: time.Now(),
+		Rooms: []PersistentRoom{{
+			Code:              "ROOM1234",
+			State:             &RoomState{RoomCode: "ROOM1234"},
+			DisconnectedUsers: map[string]*Session{"invalid": nil},
+		}},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(StateFile, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := testServer()
+	if err := server.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(server.rooms["ROOM1234"].DisconnectedUsers); got != 0 {
+		t.Fatalf("restored %d nil disconnected sessions", got)
 	}
 }
 

@@ -238,6 +238,9 @@ func (s *Server) LoadState() error {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("unmarshal state: %w", err)
 	}
+	if err := os.Remove(StateFile); err != nil {
+		return fmt.Errorf("consume state file: %w", err)
+	}
 
 	// Calculate time elapsed since shutdown
 	shutdownDuration := time.Since(state.ServerShutdownTime)
@@ -293,7 +296,11 @@ func (s *Server) LoadState() error {
 		}
 
 		// Update disconnect times for all users to account for shutdown duration
-		for _, session := range room.DisconnectedUsers {
+		for userID, session := range room.DisconnectedUsers {
+			if session == nil {
+				delete(room.DisconnectedUsers, userID)
+				continue
+			}
 			session.DisconnectAt = session.DisconnectAt.Add(shutdownDuration)
 		}
 

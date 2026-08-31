@@ -1,6 +1,7 @@
 package server
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +139,32 @@ func TestHandleClientDisconnectWithoutRoomDoesNothing(t *testing.T) {
 	}
 }
 
+func TestHandleClientDisconnectDoesNotRemoveReplacementClient(t *testing.T) {
+	server := testServer()
+	host := newClient("host", nil)
+	host.setUsername("Host")
+	replacement := newClient("guest", nil)
+	replacement.setUsername("Replacement")
+	room := lifecycleTestRoom(host, replacement)
+	stale := newClient("guest", nil)
+	stale.setUsername("Stale")
+	stale.setSessionToken("stale-token")
+	stale.setRoom(room)
+	server.rooms[room.Code] = room
+
+	server.handleClientDisconnect(stale)
+
+	if room.Clients["guest"] != replacement {
+		t.Fatal("stale disconnect removed the replacement client")
+	}
+	if _, exists := room.DisconnectedUsers["guest"]; exists {
+		t.Fatal("stale disconnect created a disconnected member")
+	}
+	if _, exists := server.sessions["stale-token"]; exists {
+		t.Fatal("stale disconnect created a reconnect session")
+	}
+}
+
 func TestHandleReconnectGuest(t *testing.T) {
 	server := testServer()
 	host := newClient("host", nil)
@@ -192,6 +219,96 @@ func TestHandleReconnectGuest(t *testing.T) {
 	}
 	if notification.UserId != "guest" || notification.Username != "Guest" {
 		t.Fatalf("unexpected reconnect notification: %#v", &notification)
+	}
+}
+
+func TestConcurrentReconnectConsumesSessionOnce(t *testing.T) {
+	server := testServer()
+	host := newClient("host", nil)
+	host.setUsername("Host")
+	session := &Session{
+		UserID:       "guest",
+		Username:     "Guest",
+		RoomCode:     "ROOM1234",
+		DisconnectAt: time.Now(),
+	}
+	room := lifecycleTestRoom(host, nil)
+	room.State.Users = append(room.State.Users, UserInfo{UserID: "guest", Username: "Guest", IsConnected: false})
+	room.DisconnectedUsers["guest"] = session
+	server.rooms[room.Code] = room
+	server.sessions["guest-token"] = session
+	payload := encodeTestPayload(t, MsgTypeReconnect, &ReconnectPayload{SessionToken: "guest-token"})
+
+	const contenders = 8
+	clients := make([]*Client, contenders)
+	start := make(chan struct{})
+	completed := make(chan struct{}, contenders)
+	var ready sync.WaitGroup
+	ready.Add(contenders)
+
+	server.mu.Lock()
+	room.syncMu.Lock()
+	for i := range clients {
+		clients[i] = newClient("temporary", nil)
+		go func(client *Client) {
+			ready.Done()
+			<-start
+			server.handleReconnect(client, payload)
+			completed <- struct{}{}
+		}(clients[i])
+	}
+	ready.Wait()
+	close(start)
+	server.mu.Unlock()
+
+	completedCount := 0
+	timer := time.NewTimer(time.Second)
+	timedOut := false
+	for completedCount < contenders-1 && !timedOut {
+		select {
+		case <-completed:
+			completedCount++
+		case <-timer.C:
+			timedOut = true
+		}
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	room.syncMu.Unlock()
+	for completedCount < contenders {
+		select {
+		case <-completed:
+			completedCount++
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for reconnect attempts")
+		}
+	}
+	if timedOut {
+		t.Fatal("reconnect contenders reached the room lock before losing the session claim")
+	}
+
+	reconnected := 0
+	for _, client := range clients {
+		switch messageType := receiveTestMessage(t, client, nil); messageType {
+		case MsgTypeReconnected:
+			reconnected++
+		case MsgTypeError:
+		default:
+			t.Fatalf("unexpected reconnect response %q", messageType)
+		}
+	}
+	if reconnected != 1 {
+		t.Fatalf("successful reconnects = %d, want 1", reconnected)
+	}
+	if _, exists := server.sessions["guest-token"]; exists {
+		t.Fatal("reconnect session was not consumed")
+	}
+	if room.Clients["guest"] == nil || len(room.Clients) != 2 {
+		t.Fatalf("unexpected active clients after reconnect: %#v", room.Clients)
 	}
 }
 

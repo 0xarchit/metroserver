@@ -47,16 +47,15 @@ type Suggestion struct {
 
 // Server is the main WebSocket server
 type Server struct {
-	rooms      map[string]*Room
-	sessions   map[string]*Session // sessionToken -> Session
-	clients    map[*Client]bool
-	userAgents map[string]int // user agent -> count
-	upgrader   websocket.Upgrader
-	mu         sync.RWMutex
-	rngMu      sync.Mutex
-	logger     *zap.Logger
-	rng        *mathrand.Rand
-	startTime  time.Time // Track when server started for room retention logic
+	rooms     map[string]*Room
+	sessions  map[string]*Session // sessionToken -> Session
+	clients   map[*Client]bool
+	upgrader  websocket.Upgrader
+	mu        sync.RWMutex
+	rngMu     sync.Mutex
+	logger    *zap.Logger
+	rng       *mathrand.Rand
+	startTime time.Time // Track when server started for room retention logic
 }
 
 const (
@@ -88,18 +87,19 @@ const (
 	MaxHeaderBytes       = 65536
 	ReadTimeout          = 60 * time.Second
 	WriteTimeout         = 10 * time.Second
+	PingInterval         = 30 * time.Second
 	IdleTimeout          = 120 * time.Second
 	ShutdownTimeout      = 10 * time.Second
 	MessageRateWindow    = time.Second
 	MaxMessagesPerWindow = 60
+	SyncResponseInterval = time.Second
 )
 
 func NewServer(logger *zap.Logger) *Server {
 	s := &Server{
-		rooms:      make(map[string]*Room),
-		sessions:   make(map[string]*Session),
-		clients:    make(map[*Client]bool),
-		userAgents: make(map[string]int),
+		rooms:    make(map[string]*Room),
+		sessions: make(map[string]*Session),
+		clients:  make(map[*Client]bool),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -164,14 +164,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Warn("WebSocket upgrade error", zap.Error(err))
 		return
-	}
-
-	// Track user agent
-	ua := r.UserAgent()
-	if ua != "" {
-		s.mu.Lock()
-		s.userAgents[ua]++
-		s.mu.Unlock()
 	}
 
 	// Use Protobuf codec with compression enabled
@@ -274,11 +266,25 @@ func (s *Server) handleClientCapabilities(c *Client, payload []byte) {
 		c.sendError(s.logger, "unsupported_client", "Protobuf support is required")
 		return
 	}
+	c.negotiationMu.Lock()
+	if c.affiliationStarted {
+		c.negotiationMu.Unlock()
+		c.sendError(s.logger, "capabilities_too_late", "Client capabilities must be sent before joining a room")
+		return
+	}
+	if c.capabilitiesSet || c.codec == nil {
+		c.negotiationMu.Unlock()
+		c.sendError(s.logger, "capabilities_already_set", "Client capabilities have already been configured")
+		return
+	}
+	c.capabilitiesSet = true
+	c.codec.setCompressionEnabled(p.SupportsCompression)
 	c.sendMessage(s.logger, MsgTypeServerCapabilities, ServerCapabilitiesPayload{
 		SupportsProtobuf:    true,
 		SupportsCompression: true,
 		ServerVersion:       "1",
 	})
+	c.negotiationMu.Unlock()
 }
 
 func (s *Server) closeAllClients() {

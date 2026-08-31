@@ -11,17 +11,22 @@ import (
 )
 
 type Client struct {
-	id               atomic.Value // string
-	username         atomic.Value // string
-	sessionToken     atomic.Value // string
-	room             atomic.Pointer[Room]
-	Conn             *websocket.Conn
-	Send             chan []byte
-	closed           bool
-	rateWindowStart  time.Time
-	rateMessageCount int
-	mu               sync.Mutex
-	codec            *MessageCodec // Message codec for encoding/decoding
+	id                 atomic.Value // string
+	username           atomic.Value // string
+	sessionToken       atomic.Value // string
+	room               atomic.Pointer[Room]
+	pendingRoom        atomic.Pointer[Room]
+	capabilitiesSet    bool
+	affiliationStarted bool
+	Conn               *websocket.Conn
+	Send               chan []byte
+	closed             bool
+	rateWindowStart    time.Time
+	rateMessageCount   int
+	lastSyncResponse   time.Time
+	mu                 sync.Mutex
+	negotiationMu      sync.Mutex
+	codec              *MessageCodec // Message codec for encoding/decoding
 }
 
 func newClient(id string, conn *websocket.Conn) *Client {
@@ -71,7 +76,51 @@ func (c *Client) currentRoom() *Room {
 }
 
 func (c *Client) setRoom(room *Room) {
+	if room != nil {
+		c.markAffiliationStarted()
+	}
 	c.room.Store(room)
+}
+
+func (c *Client) trySetRoom(room *Room) bool {
+	if room == nil {
+		return false
+	}
+	c.markAffiliationStarted()
+	return c.room.CompareAndSwap(nil, room)
+}
+
+func (c *Client) clearRoom(room *Room) bool {
+	return room != nil && c.room.CompareAndSwap(room, nil)
+}
+
+func (c *Client) currentPendingRoom() *Room {
+	return c.pendingRoom.Load()
+}
+
+func (c *Client) trySetPendingRoom(room *Room) bool {
+	if room == nil || c.currentRoom() != nil {
+		return false
+	}
+	c.markAffiliationStarted()
+	if !c.pendingRoom.CompareAndSwap(nil, room) {
+		return false
+	}
+	if c.currentRoom() != nil {
+		c.pendingRoom.CompareAndSwap(room, nil)
+		return false
+	}
+	return true
+}
+
+func (c *Client) clearPendingRoom(room *Room) bool {
+	return room != nil && c.pendingRoom.CompareAndSwap(room, nil)
+}
+
+func (c *Client) markAffiliationStarted() {
+	c.negotiationMu.Lock()
+	c.affiliationStarted = true
+	c.negotiationMu.Unlock()
 }
 
 func (c *Client) isClosed() bool {
@@ -108,9 +157,21 @@ func (c *Client) allowMessage(now time.Time) bool {
 	return true
 }
 
+func (c *Client) allowSyncResponse(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.Send == nil || len(c.Send) >= cap(c.Send) {
+		return false
+	}
+	if !c.lastSyncResponse.IsZero() && now.Sub(c.lastSyncResponse) < SyncResponseInterval {
+		return false
+	}
+	c.lastSyncResponse = now
+	return true
+}
+
 func (c *Client) writePump(logger *zap.Logger) {
-	// Reduce ping frequency for efficiency (60s is sufficient for idle detection)
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(PingInterval)
 	defer func() {
 		ticker.Stop()
 		c.Conn.Close()
@@ -119,7 +180,7 @@ func (c *Client) writePump(logger *zap.Logger) {
 	for {
 		select {
 		case message, ok := <-c.Send:
-			if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			if err := c.Conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
 				logger.Debug("Failed to set write deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 				return
 			}
@@ -134,7 +195,7 @@ func (c *Client) writePump(logger *zap.Logger) {
 			}
 
 		case <-ticker.C:
-			if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			if err := c.Conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
 				logger.Debug("Failed to set write deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 				return
 			}
@@ -232,13 +293,26 @@ func sendMessageToClients(logger *zap.Logger, clients []*Client, msgType string,
 		return
 	}
 
-	msgData, err := NewMessageCodec(true).Encode(msgType, payload)
-	if err != nil {
-		logger.Error("Error encoding broadcast", zap.String("message_type", msgType), zap.Error(err))
-		return
-	}
+	var encoded [2][]byte
+	var encodedReady [2]bool
 	for _, client := range clients {
-		client.sendEncodedMessage(logger, msgType, msgData)
+		if client == nil {
+			continue
+		}
+		compressionIndex := 0
+		if client.codec != nil && client.codec.compressionEnabled.Load() {
+			compressionIndex = 1
+		}
+		if !encodedReady[compressionIndex] {
+			msgData, err := NewMessageCodec(compressionIndex == 1).Encode(msgType, payload)
+			if err != nil {
+				logger.Error("Error encoding broadcast", zap.String("message_type", msgType), zap.Error(err))
+				return
+			}
+			encoded[compressionIndex] = msgData
+			encodedReady[compressionIndex] = true
+		}
+		client.sendEncodedMessage(logger, msgType, encoded[compressionIndex])
 	}
 }
 

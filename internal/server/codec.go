@@ -6,26 +6,33 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	pb "github.com/MetrolistGroup/metroserver/proto"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
 	MaxEnvelopeTypeLength = 64
 	MaxDecodedPayloadSize = 1024 * 1024 // 1MB after optional decompression
+	MaxQueueInputSize     = MaxQueueSize * 2
 )
 
 // MessageCodec handles encoding/decoding of messages using Protocol Buffers
 type MessageCodec struct {
-	compressionEnabled bool
+	compressionEnabled atomic.Bool
 }
 
 // NewMessageCodec creates a new codec with compression settings
 func NewMessageCodec(compression bool) *MessageCodec {
-	return &MessageCodec{
-		compressionEnabled: compression,
-	}
+	codec := &MessageCodec{}
+	codec.compressionEnabled.Store(compression)
+	return codec
+}
+
+func (c *MessageCodec) setCompressionEnabled(enabled bool) {
+	c.compressionEnabled.Store(enabled)
 }
 
 // Encode encodes a message using Protocol Buffers
@@ -57,7 +64,7 @@ func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]by
 
 	// Compress payload if enabled
 	compressed := false
-	if c.compressionEnabled && len(payloadBytes) > 100 {
+	if c.compressionEnabled.Load() && len(payloadBytes) > 100 {
 		compressedBytes, err := compressData(payloadBytes)
 		if err == nil && len(compressedBytes) < len(payloadBytes) {
 			payloadBytes = compressedBytes
@@ -439,6 +446,9 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 		}
 		return &RejectJoinPayload{UserID: pbb.UserId, Reason: pbb.Reason}, nil
 	case MsgTypePlaybackAction:
+		if err := validatePlaybackActionCardinality(data); err != nil {
+			return nil, err
+		}
 		var pbMsg pb.PlaybackActionPayload
 		if err := proto.Unmarshal(data, &pbMsg); err != nil {
 			return nil, err
@@ -458,6 +468,9 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 			payload.TrackInfo = protoToTrackInfo(pbMsg.TrackInfo)
 		}
 		if pbMsg.Queue != nil {
+			if len(pbMsg.Queue) > MaxQueueInputSize {
+				return nil, fmt.Errorf("queue has more than %d entries", MaxQueueInputSize)
+			}
 			payload.Queue = make([]TrackInfo, len(pbMsg.Queue))
 			for i, track := range pbMsg.Queue {
 				payload.Queue[i] = *protoToTrackInfo(track)
@@ -525,6 +538,30 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 	default:
 		return nil, fmt.Errorf("unsupported message type: %s", msgType)
 	}
+}
+
+func validatePlaybackActionCardinality(data []byte) error {
+	const queueFieldNumber = 6
+	queueEntries := 0
+	for len(data) > 0 {
+		number, wireType, tagLength := protowire.ConsumeTag(data)
+		if tagLength < 0 {
+			return protowire.ParseError(tagLength)
+		}
+		data = data[tagLength:]
+		fieldLength := protowire.ConsumeFieldValue(number, wireType, data)
+		if fieldLength < 0 {
+			return protowire.ParseError(fieldLength)
+		}
+		if number == queueFieldNumber && wireType == protowire.BytesType {
+			queueEntries++
+			if queueEntries > MaxQueueInputSize {
+				return fmt.Errorf("queue has more than %d entries", MaxQueueInputSize)
+			}
+		}
+		data = data[fieldLength:]
+	}
+	return nil
 }
 
 // Helper functions for converting between Go and Proto types

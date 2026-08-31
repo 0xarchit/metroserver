@@ -3,6 +3,7 @@ package server
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	pb "github.com/MetrolistGroup/metroserver/proto"
 )
@@ -274,6 +275,94 @@ func TestJoinApproveAndRejectFlows(t *testing.T) {
 	})
 }
 
+func TestJoinApprovalCannotMoveClientBetweenRooms(t *testing.T) {
+	server := testServer()
+	hostA := newClient("host-a", nil)
+	hostA.setUsername("Host A")
+	roomA := lifecycleTestRoom(hostA, nil)
+	roomA.Code = "ROOMA"
+	roomA.State.RoomCode = roomA.Code
+	hostB := newClient("host-b", nil)
+	hostB.setUsername("Host B")
+	roomB := lifecycleTestRoom(hostB, nil)
+	roomB.Code = "ROOMB"
+	roomB.State.RoomCode = roomB.Code
+	server.rooms[roomA.Code] = roomA
+	server.rooms[roomB.Code] = roomB
+
+	candidate := newClient("candidate", nil)
+	server.handleJoinRoom(candidate, encodeTestPayload(t, MsgTypeJoinRoom, &JoinRoomPayload{RoomCode: roomA.Code, Username: "Candidate"}))
+	var request pb.JoinRequestPayload
+	if got := receiveTestMessage(t, hostA, &request); got != MsgTypeJoinRequest {
+		t.Fatalf("message type = %q, want %q", got, MsgTypeJoinRequest)
+	}
+	server.handleJoinRoom(candidate, encodeTestPayload(t, MsgTypeJoinRoom, &JoinRoomPayload{RoomCode: roomB.Code, Username: "Candidate"}))
+	receiveRoomError(t, candidate, "already_pending")
+
+	server.handleApproveJoin(hostA, encodeTestPayload(t, MsgTypeApproveJoin, &ApproveJoinPayload{UserID: candidate.clientID()}))
+	receiveTestMessage(t, candidate, nil)
+	receiveTestMessage(t, hostA, nil)
+
+	// Defend against stale or legacy pending state even though new requests are single-room.
+	roomB.PendingJoins[candidate.clientID()] = candidate
+	server.handleApproveJoin(hostB, encodeTestPayload(t, MsgTypeApproveJoin, &ApproveJoinPayload{UserID: candidate.clientID()}))
+	receiveRoomError(t, hostB, "user_unavailable")
+
+	if candidate.currentRoom() != roomA || roomA.Clients[candidate.clientID()] != candidate {
+		t.Fatal("first room lost the approved client")
+	}
+	if _, exists := roomB.Clients[candidate.clientID()]; exists {
+		t.Fatal("second approval installed the client in another room")
+	}
+	if _, exists := roomB.PendingJoins[candidate.clientID()]; exists {
+		t.Fatal("stale pending join was retained")
+	}
+}
+
+func TestModerationReasonsRemainValidUTF8(t *testing.T) {
+	reason := strings.Repeat("x", 199) + "é"
+
+	t.Run("reject suggestion", func(t *testing.T) {
+		server, room, host, guest := roomTestFixture()
+		room.PendingSuggestions["suggestion"] = &Suggestion{ID: "suggestion", FromUserID: guest.clientID(), Track: &TrackInfo{ID: "track", Title: "Track"}}
+		server.handleRejectSuggestion(host, encodeTestPayload(t, MsgTypeRejectSuggestion, &RejectSuggestionPayload{SuggestionID: "suggestion", Reason: reason}))
+		var response pb.SuggestionRejectedPayload
+		if got := receiveTestMessage(t, guest, &response); got != MsgTypeSuggestionRejected {
+			t.Fatalf("message type = %q, want %q", got, MsgTypeSuggestionRejected)
+		}
+		if !utf8.ValidString(response.Reason) || len(response.Reason) > 200 {
+			t.Fatalf("invalid sanitized reason %q", response.Reason)
+		}
+	})
+
+	t.Run("reject join", func(t *testing.T) {
+		server, room, host, guest := roomTestFixture()
+		delete(room.Clients, guest.clientID())
+		guest.setRoom(nil)
+		room.PendingJoins[guest.clientID()] = guest
+		server.handleRejectJoin(host, encodeTestPayload(t, MsgTypeRejectJoin, &RejectJoinPayload{UserID: guest.clientID(), Reason: reason}))
+		var response pb.JoinRejectedPayload
+		if got := receiveTestMessage(t, guest, &response); got != MsgTypeJoinRejected {
+			t.Fatalf("message type = %q, want %q", got, MsgTypeJoinRejected)
+		}
+		if !utf8.ValidString(response.Reason) || len(response.Reason) > 200 {
+			t.Fatalf("invalid sanitized reason %q", response.Reason)
+		}
+	})
+
+	t.Run("kick", func(t *testing.T) {
+		server, _, host, guest := roomTestFixture()
+		server.handleKickUser(host, encodeTestPayload(t, MsgTypeKickUser, &KickUserPayload{UserID: guest.clientID(), Reason: reason}))
+		var response pb.KickedPayload
+		if got := receiveTestMessage(t, guest, &response); got != MsgTypeKicked {
+			t.Fatalf("message type = %q, want %q", got, MsgTypeKicked)
+		}
+		if !utf8.ValidString(response.Reason) || len(response.Reason) > 200 {
+			t.Fatalf("invalid sanitized reason %q", response.Reason)
+		}
+	})
+}
+
 func TestJoinValidationAndAuthorization(t *testing.T) {
 	server, room, host, guest := roomTestFixture()
 	delete(room.Clients, "guest")
@@ -430,6 +519,9 @@ func TestLeaveRoomEmptyAndGuest(t *testing.T) {
 		if _, exists := server.sessions["host-token"]; exists {
 			t.Fatal("sole member session was not removed")
 		}
+		if _, exists := server.rooms[room.Code]; exists {
+			t.Fatal("explicitly abandoned room remained registered")
+		}
 	})
 
 	t.Run("guest leaves active room", func(t *testing.T) {
@@ -454,4 +546,67 @@ func TestLeaveRoomEmptyAndGuest(t *testing.T) {
 
 	server := testServer()
 	server.leaveRoom(newClient("outside", nil))
+}
+
+func TestPendingJoinCanBeCancelledAndIsRejectedWhenRoomCloses(t *testing.T) {
+	t.Run("candidate cancels", func(t *testing.T) {
+		server, room, host, guest := roomTestFixture()
+		delete(room.Clients, guest.clientID())
+		room.State.Users = room.State.Users[:1]
+		guest.setRoom(nil)
+
+		server.handleJoinRoom(guest, encodeTestPayload(t, MsgTypeJoinRoom, &JoinRoomPayload{RoomCode: room.Code, Username: "Guest"}))
+		receiveTestMessage(t, host, nil)
+		server.leaveRoom(guest)
+
+		if guest.currentPendingRoom() != nil {
+			t.Fatal("candidate retained pending room after leave")
+		}
+		if _, exists := room.PendingJoins[guest.clientID()]; exists {
+			t.Fatal("cancelled join remained pending")
+		}
+	})
+
+	t.Run("host closes room", func(t *testing.T) {
+		server, room, host, guest := roomTestFixture()
+		delete(room.Clients, guest.clientID())
+		room.State.Users = room.State.Users[:1]
+		guest.setRoom(nil)
+
+		server.handleJoinRoom(guest, encodeTestPayload(t, MsgTypeJoinRoom, &JoinRoomPayload{RoomCode: room.Code, Username: "Guest"}))
+		receiveTestMessage(t, host, nil)
+		server.leaveRoom(host)
+
+		var rejected pb.JoinRejectedPayload
+		if got := receiveTestMessage(t, guest, &rejected); got != MsgTypeJoinRejected {
+			t.Fatalf("message type = %q, want %q", got, MsgTypeJoinRejected)
+		}
+		if guest.currentPendingRoom() != nil || rejected.Reason == "" {
+			t.Fatalf("pending candidate was not released: pending=%p response=%#v", guest.currentPendingRoom(), &rejected)
+		}
+		if _, exists := server.rooms[room.Code]; exists {
+			t.Fatal("closed room remained registered")
+		}
+	})
+}
+
+func TestDisconnectedGuestBecomesHostAfterHostLeaves(t *testing.T) {
+	server, room, host, guest := roomTestFixture()
+	guest.setSessionToken("guest-token")
+	server.handleClientDisconnect(guest)
+	server.leaveRoom(host)
+
+	if room.Host != nil || room.State.HostID != "" {
+		t.Fatalf("room retained departed host: host=%p host_id=%q", room.Host, room.State.HostID)
+	}
+
+	reconnecting := newClient("temporary", nil)
+	server.handleReconnect(reconnecting, encodeTestPayload(t, MsgTypeReconnect, &ReconnectPayload{SessionToken: "guest-token"}))
+	var response pb.ReconnectedPayload
+	if got := receiveTestMessage(t, reconnecting, &response); got != MsgTypeReconnected {
+		t.Fatalf("message type = %q, want %q", got, MsgTypeReconnected)
+	}
+	if !response.IsHost || room.Host != reconnecting || room.State.HostID != reconnecting.clientID() {
+		t.Fatalf("reconnected guest was not promoted: response=%#v state=%#v", &response, room.State)
+	}
 }
