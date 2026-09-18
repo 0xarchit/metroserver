@@ -7,12 +7,18 @@ import (
 	"sort"
 	"time"
 
+	"go.etcd.io/bbolt"
 	"go.uber.org/zap"
 )
 
 const (
-	StateFile        = "server_state.json"
+	StateFile        = "server_state.json" // legacy migration from pre-bbolt deployments
 	MaxStateFileSize = 50 * 1024 * 1024
+)
+
+var (
+	serverStateBucket = []byte("server_state")
+	serverStateKey    = []byte("latest")
 )
 
 // PersistentState contains all data that needs to be saved across server restarts
@@ -171,14 +177,16 @@ func (s *Server) SaveState() error {
 		state.Sessions = append(state.Sessions, sessions[token])
 	}
 
-	// Marshal to JSON
-	data, err := json.MarshalIndent(state, "", "  ")
+	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 
-	if err := writeStateFile(StateFile, data); err != nil {
-		return fmt.Errorf("write state file: %w", err)
+	if len(data) > MaxStateFileSize {
+		return fmt.Errorf("server state exceeds %d bytes", MaxStateFileSize)
+	}
+	if err := s.database.saveServerState(data); err != nil {
+		return fmt.Errorf("write server state: %w", err)
 	}
 
 	s.logger.Info("Server state saved",
@@ -188,58 +196,89 @@ func (s *Server) SaveState() error {
 	return nil
 }
 
-func writeStateFile(path string, data []byte) error {
-	tmp, err := os.CreateTemp(".", path+".*.tmp")
-	if err != nil {
-		return err
+func (d *database) saveServerState(data []byte) error {
+	if d == nil || d.db == nil {
+		return fmt.Errorf("database is not configured")
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return d.db.Update(func(tx *bbolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(serverStateBucket)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(serverStateKey, data)
+	})
 }
 
-// LoadState loads the server state from disk
-func (s *Server) LoadState() error {
-	// Check if state file exists
-	info, err := os.Stat(StateFile)
-	if os.IsNotExist(err) {
-		s.logger.Info("No previous state file found, starting fresh")
+func (d *database) loadServerState() ([]byte, error) {
+	if d == nil || d.db == nil {
+		return nil, fmt.Errorf("database is not configured")
+	}
+	var data []byte
+	err := d.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(serverStateBucket)
+		if bucket != nil {
+			data = append(data, bucket.Get(serverStateKey)...)
+		}
 		return nil
-	} else if err != nil {
-		return fmt.Errorf("stat state file: %w", err)
-	}
-	if info.Size() > MaxStateFileSize {
-		return fmt.Errorf("state file exceeds %d bytes", MaxStateFileSize)
-	}
+	})
+	return data, err
+}
 
-	// Read state file
-	data, err := os.ReadFile(StateFile)
+func (d *database) consumeServerState() error {
+	if d == nil || d.db == nil {
+		return fmt.Errorf("database is not configured")
+	}
+	return d.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(serverStateBucket)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Delete(serverStateKey)
+	})
+}
+
+// LoadState restores the most recent shutdown snapshot. The JSON fallback lets
+// the first bbolt-enabled deployment consume state written by the old binary.
+func (s *Server) LoadState() error {
+	data, err := s.database.loadServerState()
 	if err != nil {
-		return fmt.Errorf("read state file: %w", err)
+		return fmt.Errorf("read server state: %w", err)
+	}
+	fromDatabase := len(data) != 0
+	if !fromDatabase {
+		info, statErr := os.Stat(StateFile)
+		if os.IsNotExist(statErr) {
+			s.logger.Info("No previous server state found, starting fresh")
+			return nil
+		}
+		if statErr != nil {
+			return fmt.Errorf("stat legacy state file: %w", statErr)
+		}
+		if info.Size() > MaxStateFileSize {
+			return fmt.Errorf("legacy state file exceeds %d bytes", MaxStateFileSize)
+		}
+		data, err = os.ReadFile(StateFile)
+		if err != nil {
+			return fmt.Errorf("read legacy state file: %w", err)
+		}
+	}
+	if len(data) > MaxStateFileSize {
+		return fmt.Errorf("server state exceeds %d bytes", MaxStateFileSize)
 	}
 
 	var state PersistentState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("unmarshal state: %w", err)
 	}
-	if err := os.Remove(StateFile); err != nil {
-		return fmt.Errorf("consume state file: %w", err)
+	if fromDatabase {
+		if err := os.Remove(StateFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale legacy state file: %w", err)
+		}
+		if err := s.database.consumeServerState(); err != nil {
+			return fmt.Errorf("consume server state: %w", err)
+		}
+	} else if err := os.Remove(StateFile); err != nil {
+		return fmt.Errorf("consume legacy state file: %w", err)
 	}
 
 	// Calculate time elapsed since shutdown

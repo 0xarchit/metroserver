@@ -20,10 +20,29 @@ func roomClientsLocked(room *Room) []*Client {
 	return clients
 }
 
+func (s *Server) sendPolicyQueueSnapshot(client *Client, state *RoomState) {
+	if client == nil || state == nil || client.uaTier == uaAllow || client.uaTier == uaBlock {
+		return
+	}
+	trackID := ""
+	if state.CurrentTrack != nil {
+		trackID = state.CurrentTrack.ID
+	}
+	client.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+		Action:     ActionSyncQueue,
+		TrackID:    trackID,
+		Queue:      append([]TrackInfo(nil), state.Queue...),
+		Position:   state.Position,
+		ServerTime: state.LastUpdate,
+		Revision:   state.Revision,
+	})
+}
+
 func validatePlaybackTrack(c *Client, logger *zap.Logger, state *RoomState, p *PlaybackActionPayload) bool {
 	if state.CurrentTrack == nil {
 		return true
 	}
+	p.TrackID = rickMappedTrackID(c.uaTier, p.TrackID, state)
 	if p.TrackID == "" {
 		p.TrackID = state.CurrentTrack.ID
 		return true
@@ -329,7 +348,13 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 		c.sendError(s.logger, "not_in_room", "You are not an active room member")
 		return
 	}
-	if room.State.CurrentTrack == nil || p.TrackID != room.State.CurrentTrack.ID {
+	if room.State.CurrentTrack == nil {
+		room.mu.Unlock()
+		c.sendError(s.logger, "stale_track", "Buffer readiness targets a stale track")
+		return
+	}
+	p.TrackID = rickMappedTrackID(c.uaTier, p.TrackID, room.State)
+	if p.TrackID != room.State.CurrentTrack.ID {
 		room.mu.Unlock()
 		c.sendError(s.logger, "stale_track", "Buffer readiness targets a stale track")
 		return

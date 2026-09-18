@@ -222,6 +222,52 @@ func TestHandleReconnectGuest(t *testing.T) {
 	}
 }
 
+func TestAdvertGuestReconnectReceivesQueueTitle(t *testing.T) {
+	server := testServer()
+	host := newClient("host", nil)
+	host.setUsername("Host")
+	reconnecting := markTier(newClient("temporary", nil), uaAdvert)
+	session := &Session{UserID: "guest", Username: "Guest", RoomCode: "ROOM1234", DisconnectAt: time.Now()}
+	room := lifecycleTestRoom(host, nil)
+	room.State.CurrentTrack = &TrackInfo{ID: "playing", Title: "Playing", Duration: 10000}
+	room.State.Queue = []TrackInfo{{ID: "next", Title: "Next", Duration: 9000}}
+	room.State.Users = append(room.State.Users, UserInfo{UserID: "guest", Username: "Guest", IsConnected: false})
+	room.DisconnectedUsers["guest"] = session
+	server.rooms[room.Code] = room
+	server.sessions["guest-token"] = session
+
+	server.handleReconnect(reconnecting, encodeTestPayload(t, MsgTypeReconnect, &ReconnectPayload{SessionToken: "guest-token"}))
+	receiveTestMessage(t, reconnecting, &pb.ReconnectedPayload{})
+	var snapshot pb.PlaybackActionPayload
+	if got := receiveTestMessage(t, reconnecting, &snapshot); got != MsgTypeSyncPlayback {
+		t.Fatalf("message type = %q, want %q", got, MsgTypeSyncPlayback)
+	}
+	if snapshot.Action != ActionSyncQueue || snapshot.QueueTitle != DefaultAdvertTitle || snapshot.TrackId != "playing" || len(snapshot.Queue) != 1 || snapshot.Queue[0].Id != "next" {
+		t.Fatalf("unexpected policy queue snapshot: %#v", &snapshot)
+	}
+}
+
+func TestNonAllowHostCannotReconnect(t *testing.T) {
+	server := testServer()
+	reconnecting := markTier(newClient("temporary", nil), uaRickroll)
+	session := &Session{UserID: "host", Username: "Host", RoomCode: "ROOM1234", IsHost: true, DisconnectAt: time.Now()}
+	room := lifecycleTestRoom(nil, nil)
+	room.State.HostID = "host"
+	room.State.Users = []UserInfo{{UserID: "host", Username: "Host", IsHost: true, IsConnected: false}}
+	room.DisconnectedUsers["host"] = session
+	server.rooms[room.Code] = room
+	server.sessions["host-token"] = session
+
+	server.handleReconnect(reconnecting, encodeTestPayload(t, MsgTypeReconnect, &ReconnectPayload{SessionToken: "host-token"}))
+	receiveLifecycleError(t, reconnecting, "host_not_allowed")
+	if server.sessions["host-token"] != session || room.DisconnectedUsers["host"] != session {
+		t.Fatal("rejected host reconnect consumed the session")
+	}
+	if reconnecting.currentRoom() != nil || room.Host != nil {
+		t.Fatal("non-allow client regained the host role")
+	}
+}
+
 func TestConcurrentReconnectConsumesSessionOnce(t *testing.T) {
 	server := testServer()
 	host := newClient("host", nil)

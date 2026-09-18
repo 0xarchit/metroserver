@@ -175,6 +175,45 @@ func TestSuggestionFailures(t *testing.T) {
 	})
 }
 
+func TestOnlyAllowTierCanHost(t *testing.T) {
+	for _, tier := range []uaTier{uaAdvert, uaRickroll} {
+		t.Run(tier.String()+" create", func(t *testing.T) {
+			server := testServer()
+			client := markTier(newClient("creator", nil), tier)
+			server.handleCreateRoom(client, encodeTestPayload(t, MsgTypeCreateRoom, &CreateRoomPayload{Username: "Creator"}))
+			receiveRoomError(t, client, "host_not_allowed")
+			if client.currentRoom() != nil || len(server.rooms) != 0 {
+				t.Fatal("non-allow client created a room")
+			}
+		})
+	}
+
+	t.Run("transfer", func(t *testing.T) {
+		server, room, host, guest := roomTestFixture()
+		markTier(guest, uaAdvert)
+		server.handleTransferHost(host, encodeTestPayload(t, MsgTypeTransferHost, &TransferHostPayload{NewHostID: guest.clientID()}))
+		receiveRoomError(t, host, "host_not_allowed")
+		if room.Host != host || room.State.HostID != host.clientID() {
+			t.Fatal("host role transferred to a non-allow client")
+		}
+	})
+
+	t.Run("automatic transfer", func(t *testing.T) {
+		server, room, host, advert := roomTestFixture()
+		markTier(advert, uaAdvert)
+		allowed := newClient("allowed", nil)
+		allowed.setUsername("Allowed")
+		allowed.setRoom(room)
+		room.Clients[allowed.clientID()] = allowed
+		room.State.Users = append(room.State.Users, UserInfo{UserID: allowed.clientID(), Username: allowed.userName(), IsConnected: true})
+
+		server.leaveRoom(host)
+		if room.Host != allowed || room.State.HostID != allowed.clientID() {
+			t.Fatalf("automatic host = %v, want allowlisted client", room.Host)
+		}
+	})
+}
+
 func TestCreateRoomHappyPathAndValidation(t *testing.T) {
 	server := testServer()
 	client := newClient("creator", nil)
@@ -256,6 +295,29 @@ func TestJoinApproveAndRejectFlows(t *testing.T) {
 		var joined pb.UserJoinedPayload
 		if got := receiveTestMessage(t, host, &joined); got != MsgTypeUserJoined || joined.UserId != "guest" {
 			t.Fatalf("unexpected joined notification: type=%q payload=%#v", got, &joined)
+		}
+	})
+
+	t.Run("advert guest receives queue title immediately", func(t *testing.T) {
+		server, room, host, guest := roomTestFixture()
+		delete(room.Clients, guest.clientID())
+		room.State.Users = room.State.Users[:1]
+		guest.setRoom(nil)
+		markTier(guest, uaAdvert)
+		room.State.CurrentTrack = &TrackInfo{ID: "playing", Title: "Playing", Duration: 10000}
+		room.State.Queue = []TrackInfo{{ID: "next", Title: "Next", Duration: 9000}}
+
+		server.handleJoinRoom(guest, encodeTestPayload(t, MsgTypeJoinRoom, &JoinRoomPayload{RoomCode: room.Code, Username: "Guest"}))
+		receiveTestMessage(t, host, nil)
+		server.handleApproveJoin(host, encodeTestPayload(t, MsgTypeApproveJoin, &ApproveJoinPayload{UserID: guest.clientID()}))
+		receiveTestMessage(t, guest, &pb.JoinApprovedPayload{})
+
+		var snapshot pb.PlaybackActionPayload
+		if got := receiveTestMessage(t, guest, &snapshot); got != MsgTypeSyncPlayback {
+			t.Fatalf("message type = %q, want %q", got, MsgTypeSyncPlayback)
+		}
+		if snapshot.Action != ActionSyncQueue || snapshot.QueueTitle != DefaultAdvertTitle || snapshot.TrackId != "playing" || len(snapshot.Queue) != 1 || snapshot.Queue[0].Id != "next" {
+			t.Fatalf("unexpected policy queue snapshot: %#v", &snapshot)
 		}
 	})
 

@@ -24,6 +24,9 @@ type Client struct {
 	rateWindowStart    time.Time
 	rateMessageCount   int
 	lastSyncResponse   time.Time
+	uaTier             uaTier
+	policy             *uaPolicy
+	connectionSlot     bool
 	mu                 sync.Mutex
 	negotiationMu      sync.Mutex
 	codec              *MessageCodec // Message codec for encoding/decoding
@@ -210,6 +213,9 @@ func (c *Client) readPump(s *Server) {
 	defer func() {
 		s.removeClient(c)
 		c.Conn.Close()
+		if c.connectionSlot {
+			s.releaseConnectionSlot()
+		}
 	}()
 
 	c.Conn.SetReadLimit(MaxReadMessageSize)
@@ -245,10 +251,21 @@ func (c *Client) readPump(s *Server) {
 	}
 }
 
+// rewritePayload applies this client's User-Agent tier to an outgoing payload.
+// uaTier and policy are written before the client's pumps start and read-only
+// afterwards.
+func (c *Client) rewritePayload(payload interface{}) interface{} {
+	if c.policy == nil {
+		return payload
+	}
+	return rewriteForUATier(c.uaTier, c.policy.advertTitle, payload)
+}
+
 func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interface{}) {
 	if c == nil || c.codec == nil || c.Send == nil {
 		return
 	}
+	payload = c.rewritePayload(payload)
 
 	// Use the client's codec to encode the message
 	msgData, err := c.codec.Encode(msgType, payload)
@@ -293,8 +310,10 @@ func sendMessageToClients(logger *zap.Logger, clients []*Client, msgType string,
 		return
 	}
 
-	var encoded [2][]byte
-	var encodedReady [2]bool
+	// Encode once per (tier, compression) combination: rewritten payloads must
+	// not leak into the bytes other recipients get.
+	var encoded [uaTierCount][2][]byte
+	var encodedReady [uaTierCount][2]bool
 	for _, client := range clients {
 		if client == nil {
 			continue
@@ -303,16 +322,16 @@ func sendMessageToClients(logger *zap.Logger, clients []*Client, msgType string,
 		if client.codec != nil && client.codec.compressionEnabled.Load() {
 			compressionIndex = 1
 		}
-		if !encodedReady[compressionIndex] {
-			msgData, err := NewMessageCodec(compressionIndex == 1).Encode(msgType, payload)
+		if !encodedReady[client.uaTier][compressionIndex] {
+			msgData, err := NewMessageCodec(compressionIndex == 1).Encode(msgType, client.rewritePayload(payload))
 			if err != nil {
 				logger.Error("Error encoding broadcast", zap.String("message_type", msgType), zap.Error(err))
 				return
 			}
-			encoded[compressionIndex] = msgData
-			encodedReady[compressionIndex] = true
+			encoded[client.uaTier][compressionIndex] = msgData
+			encodedReady[client.uaTier][compressionIndex] = true
 		}
-		client.sendEncodedMessage(logger, msgType, encoded[compressionIndex])
+		client.sendEncodedMessage(logger, msgType, encoded[client.uaTier][compressionIndex])
 	}
 }
 

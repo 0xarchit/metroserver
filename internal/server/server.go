@@ -47,15 +47,18 @@ type Suggestion struct {
 
 // Server is the main WebSocket server
 type Server struct {
-	rooms     map[string]*Room
-	sessions  map[string]*Session // sessionToken -> Session
-	clients   map[*Client]bool
-	upgrader  websocket.Upgrader
-	mu        sync.RWMutex
-	rngMu     sync.Mutex
-	logger    *zap.Logger
-	rng       *mathrand.Rand
-	startTime time.Time // Track when server started for room retention logic
+	rooms           map[string]*Room
+	sessions        map[string]*Session // sessionToken -> Session
+	clients         map[*Client]bool
+	upgrader        websocket.Upgrader
+	mu              sync.RWMutex
+	rngMu           sync.Mutex
+	logger          *zap.Logger
+	uaPolicy        *uaPolicy
+	database        *database
+	connectionSlots chan struct{}
+	rng             *mathrand.Rand
+	startTime       time.Time // Track when server started for room retention logic
 }
 
 const (
@@ -107,9 +110,11 @@ func NewServer(logger *zap.Logger) *Server {
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
 		},
-		logger:    logger,
-		rng:       mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
-		startTime: time.Now(),
+		logger:          logger,
+		uaPolicy:        defaultUAPolicy(),
+		connectionSlots: make(chan struct{}, MaxClients),
+		rng:             mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
+		startTime:       time.Now(),
 	}
 
 	// Start cleanup goroutines
@@ -151,6 +156,24 @@ func (s *Server) generateSessionToken() string {
 	return hex.EncodeToString(b)
 }
 
+func (s *Server) tryAcquireConnectionSlot() bool {
+	if s.connectionSlots == nil {
+		return true
+	}
+	select {
+	case s.connectionSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseConnectionSlot() {
+	if s.connectionSlots != nil {
+		<-s.connectionSlots
+	}
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	clientCount := len(s.clients)
@@ -159,6 +182,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server at connection capacity", http.StatusServiceUnavailable)
 		return
 	}
+	if !s.tryAcquireConnectionSlot() {
+		http.Error(w, "server at connection capacity", http.StatusServiceUnavailable)
+		return
+	}
+	slotOwned := true
+	defer func() {
+		if slotOwned {
+			s.releaseConnectionSlot()
+		}
+	}()
 
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -169,6 +202,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Use Protobuf codec with compression enabled
 	client := newClient(s.generateUserID(), conn)
 
+	userAgent := r.Header.Get("User-Agent")
+	tier := s.uaPolicy.resolve(userAgent)
+	if err := s.database.recordUserAgent(userAgent); err != nil {
+		s.logger.Warn("Failed to record User-Agent", zap.Error(err))
+	}
+	client.uaTier = tier
+	client.policy = s.uaPolicy
+	if tier == uaBlock {
+		// Write synchronously so blocked connections cannot create untracked pumps.
+		s.logger.Debug("Blocked client", zap.String("client_id", client.clientID()))
+		message, encodeErr := client.codec.Encode(MsgTypeError, ErrorPayload{Code: "blocked_client", Message: BlockedClientMessage})
+		if encodeErr != nil {
+			s.logger.Error("Failed to encode blocked-client response", zap.Error(encodeErr))
+		} else if err := conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err == nil {
+			_ = conn.WriteMessage(websocket.BinaryMessage, message)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "blocked client"), time.Now().Add(WriteTimeout))
+		}
+		_ = conn.Close()
+		return
+	}
+
 	s.mu.Lock()
 	if len(s.clients) >= MaxClients {
 		s.mu.Unlock()
@@ -178,10 +232,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.clients[client] = true
 	s.mu.Unlock()
 
+	client.connectionSlot = true
+	slotOwned = false
 	go client.writePump(s.logger)
 	go client.readPump(s)
 
-	s.logger.Info("Client connected", zap.String("client_id", client.clientID()))
+	s.logger.Info("Client connected", zap.String("client_id", client.clientID()), zap.String("ua_tier", tier.String()))
 }
 
 func (s *Server) handleMessage(c *Client, data []byte) {

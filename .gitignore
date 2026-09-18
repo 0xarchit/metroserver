@@ -2,4 +2,5 @@
 proto/listentogether.pb.go
 /metroserver
 server_state.json
+metroserver.db*
 coverage.out
