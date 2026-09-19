@@ -23,6 +23,28 @@ func Run() {
 
 	server := NewServer(logger)
 
+	// User-Agent policy (block / advertise Metrolist / rickroll freeloaders).
+	ua, err := loadUAPolicy(os.Getenv("UA_POLICY_FILE"))
+	if err != nil {
+		logger.Fatal("Failed to load UA policy", zap.Error(err))
+	}
+	server.uaPolicy = ua
+	logger.Info("User-Agent policy loaded",
+		zap.Int("block", len(ua.block)),
+		zap.Int("rickroll", len(ua.rickroll)),
+		zap.Int("advert", len(ua.advert)),
+		zap.Int("allow", len(ua.allow)+len(ua.allowExact)))
+
+	databaseFile := os.Getenv("DATABASE_FILE")
+	if databaseFile == "" {
+		databaseFile = DefaultDatabaseFile
+	}
+	server.database, err = openDatabase(databaseFile)
+	if err != nil {
+		logger.Fatal("Failed to open database", zap.Error(err))
+	}
+	defer server.database.Close()
+
 	// Load previous state if exists
 	if err := server.LoadState(); err != nil {
 		logger.Error("Failed to load previous state", zap.Error(err))
@@ -36,6 +58,9 @@ func Run() {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	if adminToken := os.Getenv("UA_ADMIN_TOKEN"); adminToken != "" {
+		mux.HandleFunc("/uas", server.userAgentsHandler(adminToken))
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

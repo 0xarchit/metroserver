@@ -43,7 +43,7 @@ WORKDIR /app
 COPY --from=builder /build/metroserver .
 
 # Change ownership to non-root user
-RUN chown -R metrolist:metrolist /app
+RUN mkdir /app/data && chown -R metrolist:metrolist /app
 
 # Switch to non-root user
 USER metrolist

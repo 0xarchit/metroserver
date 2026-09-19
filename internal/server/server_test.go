@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -116,16 +117,17 @@ func TestApproveSuggestionQueueFullKeepsSuggestion(t *testing.T) {
 }
 
 func TestSaveStateIncludesActiveSessionsAndLoadHasNoPlaceholderHost(t *testing.T) {
-	oldWD, err := os.Getwd()
+	databasePath := filepath.Join(t.TempDir(), DefaultDatabaseFile)
+	server := testServer()
+	var err error
+	server.database, err = openDatabase(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(t.TempDir()); err != nil {
+	if err := server.database.recordUserAgent("okhttp/4.12.0"); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(oldWD) })
 
-	server := testServer()
 	host := newClient("host", nil)
 	host.setUsername("host")
 	host.setSessionToken("token-host")
@@ -150,15 +152,23 @@ func TestSaveStateIncludesActiveSessionsAndLoadHasNoPlaceholderHost(t *testing.T
 	if err := server.SaveState(); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(StateFile)
+	if err := server.database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
-		t.Fatalf("state file permissions = %v, want 0600", info.Mode().Perm())
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("database permissions = %v, want 0600", info.Mode().Perm())
 	}
 
 	restored := testServer()
+	restored.database, err = openDatabase(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restored.database.Close() })
 	if err := restored.LoadState(); err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +185,12 @@ func TestSaveStateIncludesActiveSessionsAndLoadHasNoPlaceholderHost(t *testing.T
 	if restoredRoom.HostDisconnectedAt == nil || time.Since(*restoredRoom.HostDisconnectedAt) > time.Minute {
 		t.Fatal("host disconnected timestamp was not restored")
 	}
-	if _, err := os.Stat(StateFile); !os.IsNotExist(err) {
-		t.Fatalf("consumed state file still exists: %v", err)
+	if counts, err := restored.database.userAgentCounts(); err != nil || counts["okhttp/4.12.0"] != 1 {
+		t.Fatalf("shared database lost User-Agent counts: %#v, %v", counts, err)
 	}
 
 	replayed := testServer()
+	replayed.database = restored.database
 	if err := replayed.LoadState(); err != nil {
 		t.Fatal(err)
 	}
@@ -215,11 +226,42 @@ func TestLoadStateIgnoresNilDisconnectedSessions(t *testing.T) {
 	}
 
 	server := testServer()
+	server.database, err = openDatabase(DefaultDatabaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.database.Close() })
 	if err := server.LoadState(); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(server.rooms["ROOM1234"].DisconnectedUsers); got != 0 {
 		t.Fatalf("restored %d nil disconnected sessions", got)
+	}
+	if _, err := os.Stat(StateFile); !os.IsNotExist(err) {
+		t.Fatalf("legacy state file was not consumed: %v", err)
+	}
+}
+
+func TestMalformedDatabaseStateIsNotConsumed(t *testing.T) {
+	server := testServer()
+	var err error
+	server.database, err = openDatabase(filepath.Join(t.TempDir(), DefaultDatabaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.database.Close() })
+	if err := server.database.saveServerState([]byte("{")); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.LoadState(); err == nil {
+		t.Fatal("malformed state was accepted")
+	}
+	data, err := server.database.loadServerState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 {
+		t.Fatal("malformed state was consumed before successful parsing")
 	}
 }
 

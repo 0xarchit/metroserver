@@ -62,13 +62,7 @@ func (s *Server) cleanupExpiredSessionsOnce(now time.Time) {
 
 		var hostChanged *HostChangedPayload
 		if expiredWasHost {
-			var newHost *Client
-			for _, client := range room.Clients {
-				if client != nil {
-					newHost = client
-					break
-				}
-			}
+			newHost := firstEligibleHost(room.Clients)
 			room.Host = newHost
 			room.HostDisconnectedAt = nil
 			if newHost != nil {
@@ -331,6 +325,11 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	s.mu.Lock()
 	session, exists := s.sessions[p.SessionToken]
 	expired := exists && (session == nil || now.Sub(session.DisconnectAt) > ReconnectGracePeriod)
+	if exists && !expired && session.IsHost && !canHostClient(c) {
+		s.mu.Unlock()
+		c.sendError(s.logger, "host_not_allowed", "Only allowlisted clients can host rooms")
+		return
+	}
 	if exists {
 		delete(s.sessions, p.SessionToken)
 	}
@@ -394,7 +393,7 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	}
 
 	// Restore host status if they were the host
-	if session.IsHost || (room.Host == nil && room.State.HostID == "") {
+	if session.IsHost || (canHostClient(c) && room.Host == nil && room.State.HostID == "") {
 		room.Host = c
 		room.HostDisconnectedAt = nil
 		room.State.HostID = session.UserID
@@ -451,6 +450,7 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		State:    liveState,
 		IsHost:   isHost,
 	})
+	s.sendPolicyQueueSnapshot(c, liveState)
 	room.syncMu.Unlock()
 
 	if isHost {

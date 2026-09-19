@@ -224,6 +224,11 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 }
 
 func (s *Server) handleCreateRoom(c *Client, payload []byte) {
+	if !canHostClient(c) {
+		c.sendError(s.logger, "host_not_allowed", "Only allowlisted clients can host rooms")
+		return
+	}
+
 	var p CreateRoomPayload
 	if err := decodePayload(payload, MsgTypeCreateRoom, &p); err != nil {
 		c.sendError(s.logger, "invalid_payload", "Invalid create room payload")
@@ -559,6 +564,7 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 	room.mu.Unlock()
 
 	joiningClient.sendMessage(s.logger, MsgTypeJoinApproved, approval)
+	s.sendPolicyQueueSnapshot(joiningClient, approval.State)
 	sendMessageToClients(s.logger, clientsToNotify, MsgTypeUserJoined, UserJoinedPayload{
 		UserID: joiningID, Username: joiningUsername,
 	})
@@ -754,6 +760,10 @@ func (s *Server) handleTransferHost(c *Client, payload []byte) {
 		c.sendError(s.logger, "user_not_found", "Target user not found in room")
 		return
 	}
+	if !canHostClient(newHostClient) {
+		c.sendError(s.logger, "host_not_allowed", "Only allowlisted clients can host rooms")
+		return
+	}
 
 	// Transfer host role
 	oldHostID := c.clientID()
@@ -846,10 +856,7 @@ func (s *Server) leaveRoom(c *Client) {
 	// If host left, transfer to another user
 	var newHost *Client
 	if wasHost {
-		for _, client := range room.Clients {
-			newHost = client
-			break
-		}
+		newHost = firstEligibleHost(room.Clients)
 		if newHost != nil {
 			room.Host = newHost
 			room.State.HostID = newHost.clientID()
